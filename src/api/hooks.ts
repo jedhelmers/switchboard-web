@@ -9,6 +9,7 @@ import {
   api,
   APIError,
   type AttachmentFile,
+  type Reaction,
   type Channel,
   type DMSummary,
   type Health,
@@ -196,12 +197,25 @@ export function useRealtime(): ConnectionState {
 // Pages are returned newest-first; fetchNextPage loads OLDER messages
 // (the API cursor walks backward in time). Realtime push updates the first page
 // in place; falls back to polling the first page when the WS is closed.
-export function useMessages(channelId: string | null, realtimeOpen: boolean = false) {
+//
+// anchorId (optional): when set, the FIRST page is fetched with ?anchor=<id>
+// returning a window centered on that message. Used by "scroll to message"
+// from search results. After the anchor fetch, fetchNextPage walks normally
+// backward from the oldest message in the window. Anchor is part of the
+// query key so changing it forces a fresh first fetch.
+export function useMessages(
+  channelId: string | null,
+  realtimeOpen: boolean = false,
+  anchorId: string | null = null,
+) {
   return useInfiniteQuery<MessagesPage, Error, MessagesInfiniteData, readonly unknown[], string | undefined>({
-    queryKey: ['messages', channelId],
+    queryKey: ['messages', channelId, anchorId ?? ''],
     queryFn: ({ pageParam }) => {
-      const qs = pageParam ? `?cursor=${encodeURIComponent(pageParam)}` : ''
-      return api.get<MessagesPage>(`/v1/channels/${channelId}/messages${qs}`)
+      const params = new URLSearchParams()
+      if (pageParam) params.set('cursor', pageParam)
+      else if (anchorId) params.set('anchor', anchorId)
+      const qs = params.toString()
+      return api.get<MessagesPage>(`/v1/channels/${channelId}/messages${qs ? `?${qs}` : ''}`)
     },
     initialPageParam: undefined,
     getNextPageParam: (lastPage) => lastPage.next_cursor,
@@ -236,6 +250,109 @@ export function usePostMessage(channelId: string | null) {
     },
   })
 }
+
+// ---- message edit / delete / reactions -------------------------------------
+
+// Helper: patch one message in the infinite cache for a channel.
+function patchMessage(
+  qc: QueryClient,
+  channelId: string,
+  messageId: string,
+  fn: (m: Message) => Message,
+) {
+  qc.setQueryData<MessagesInfiniteData>(['messages', channelId], (prev) => {
+    if (!prev) return prev
+    return {
+      ...prev,
+      pages: prev.pages.map((p) => ({
+        ...p,
+        messages: p.messages.map((m) => (m.id === messageId ? fn(m) : m)),
+      })),
+    }
+  })
+}
+
+// Helper: drop one message from the infinite cache for a channel.
+function dropMessage(qc: QueryClient, channelId: string, messageId: string) {
+  qc.setQueryData<MessagesInfiniteData>(['messages', channelId], (prev) => {
+    if (!prev) return prev
+    return {
+      ...prev,
+      pages: prev.pages.map((p) => ({
+        ...p,
+        messages: p.messages.filter((m) => m.id !== messageId),
+      })),
+    }
+  })
+}
+
+export function useEditMessage(channelId: string | null) {
+  return useMutation({
+    mutationFn: (vars: { messageId: string; text: string; payload?: unknown }) =>
+      api.patch<Message>(`/v1/messages/${vars.messageId}`, {
+        text: vars.text,
+        payload: vars.payload,
+      }),
+    // No optimistic update: server returns the canonical edited message and
+    // realtime patcher will push it to other clients. We refresh ours via
+    // the mutation result here.
+  })
+}
+
+export function useDeleteMessage(channelId: string | null) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (messageId: string) => api.del(`/v1/messages/${messageId}`),
+    onMutate: (messageId) => {
+      if (!channelId) return
+      // Optimistic drop. Realtime message.deleted will arrive shortly and
+      // de-dups via the same filter.
+      dropMessage(qc, channelId, messageId)
+    },
+  })
+}
+
+export function useToggleReaction(channelId: string | null, currentUserID: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (vars: { messageId: string; emoji: string; alreadyReacted: boolean }) => {
+      if (vars.alreadyReacted) {
+        await api.del(`/v1/messages/${vars.messageId}/reactions/${encodeURIComponent(vars.emoji)}`)
+      } else {
+        await api.post(`/v1/messages/${vars.messageId}/reactions`, { emoji: vars.emoji })
+      }
+    },
+    onMutate: ({ messageId, emoji, alreadyReacted }) => {
+      if (!channelId) return
+      // Optimistically toggle the reaction in cache so the UI snaps without
+      // waiting for server + realtime round-trip.
+      patchMessage(qc, channelId, messageId, (m) => {
+        const next = (m.reactions ?? []).slice()
+        const idx = next.findIndex((r) => r.emoji === emoji)
+        if (alreadyReacted) {
+          if (idx === -1) return m
+          const r = next[idx]!
+          const users = r.user_ids.filter((u) => u !== currentUserID)
+          if (users.length === 0) next.splice(idx, 1)
+          else next[idx] = { ...r, count: users.length, user_ids: users }
+        } else {
+          if (idx === -1) {
+            next.push({ emoji, count: 1, user_ids: [currentUserID] })
+          } else {
+            const r = next[idx]!
+            if (r.user_ids.includes(currentUserID)) return m
+            next[idx] = { ...r, count: r.count + 1, user_ids: [...r.user_ids, currentUserID] }
+          }
+        }
+        return { ...m, reactions: next }
+      })
+    },
+  })
+}
+
+// keep Reaction in scope to satisfy unused-import lint when this file is
+// referenced for types only.
+export type { Reaction }
 
 // ---- channels: create / browse / join --------------------------------------
 
@@ -275,6 +392,31 @@ export function useJoinChannel(slug: string | null) {
       qc.invalidateQueries({ queryKey: ['channels', slug] })
       qc.invalidateQueries({ queryKey: ['public-channels', slug] })
     },
+  })
+}
+
+// ---- search ----------------------------------------------------------------
+
+// useSearchMessages runs full-text search against the workspace, optionally
+// scoped to a single channel. Empty queries short-circuit to no request.
+// Debouncing happens in the consumer via debouncing the `q` value passed in.
+export function useSearchMessages(
+  slug: string | null,
+  q: string,
+  channelId: string | null,
+) {
+  return useQuery({
+    queryKey: ['search', slug, q, channelId ?? ''],
+    queryFn: () => {
+      const params = new URLSearchParams()
+      params.set('q', q)
+      if (channelId) params.set('channel_id', channelId)
+      return api
+        .get<{ messages: Message[] }>(`/v1/workspaces/${slug}/search?${params.toString()}`)
+        .then((r) => r.messages)
+    },
+    enabled: !!slug && q.trim().length > 0,
+    staleTime: 5_000,
   })
 }
 

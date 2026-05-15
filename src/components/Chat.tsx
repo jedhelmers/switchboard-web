@@ -6,6 +6,10 @@ import {
   AtSign,
   Bold,
   ChevronDown,
+  Pencil,
+  Search,
+  Trash2,
+  SmilePlus,
   Code,
   FileCode,
   FileText,
@@ -28,6 +32,10 @@ import {
 import {
   uploadAttachment,
   useChannels,
+  useDeleteMessage,
+  useEditMessage,
+  useSearchMessages,
+  useToggleReaction,
   useTypingNotifier,
   useTypingState,
   useCreateChannel,
@@ -79,6 +87,14 @@ export function Chat({
   const [internalSlug, setInternalSlug] = useState<string | null>(null)
   const [internalChannelId, setInternalChannelId] = useState<string | null>(null)
   const [showInvites, setShowInvites] = useState(false)
+  // When a search result is clicked, we set this to {channelId, messageId};
+  // ChannelView/MessageList consume it to anchor-load + scroll-to + briefly
+  // highlight the target. Cleared by MessageList after the scroll lands so
+  // re-clicking the same result re-triggers the scroll.
+  const [scrollTarget, setScrollTarget] = useState<{
+    channelId: string
+    messageId: string
+  } | null>(null)
   // Just-started DMs we haven't yet sent a message in. The server hides them
   // from useDMs (no messages yet) so the recipient doesn't see them; we keep
   // them locally so the initiator can see + select their fresh DM in the
@@ -190,13 +206,31 @@ export function Chat({
     }
   }
 
-  function handleSelectChannel(nextChannelId: string) {
+  function handleSelectChannel(nextChannelId: string, targetMessageId?: string) {
+    if (targetMessageId) {
+      setScrollTarget({ channelId: nextChannelId, messageId: targetMessageId })
+    } else {
+      setScrollTarget(null)
+    }
     if (onSelectChannel && slug) onSelectChannel(slug, nextChannelId)
     else setInternalChannelId(nextChannelId)
   }
 
   return (
-    <div className="grid h-screen grid-cols-[260px_1fr] overflow-hidden bg-zinc-950 text-zinc-100">
+    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
+      <header className="flex h-11 shrink-0 items-center justify-center border-b border-zinc-800 bg-zinc-900/60 px-4">
+        <SearchBar
+          workspaceSlug={slug}
+          channels={channels ?? []}
+          dms={dms ?? []}
+          pendingDMs={pendingDMs}
+          onJump={(channelId) => handleSelectChannel(channelId)}
+          onJumpToMessage={(channelId, messageId) =>
+            handleSelectChannel(channelId, messageId)
+          }
+        />
+      </header>
+      <div className="grid min-h-0 flex-1 grid-cols-[260px_1fr] overflow-hidden">
       <aside className="flex flex-col min-h-0 overflow-hidden border-r border-zinc-800 bg-zinc-900/50">
         <header className="px-4 py-3 border-b border-zinc-800 space-y-2">
           <select
@@ -277,6 +311,12 @@ export function Chat({
             members={members}
             currentUserID={user.id}
             realtimeOpen={rtState === 'open'}
+            scrollTargetMessageId={
+              scrollTarget && scrollTarget.channelId === activeChannel.id
+                ? scrollTarget.messageId
+                : null
+            }
+            onScrollHandled={() => setScrollTarget(null)}
           />
         ) : (
           <FullPageMessage>Select a channel to start chatting.</FullPageMessage>
@@ -287,6 +327,7 @@ export function Chat({
           {rtState === 'connecting' ? 'Connecting…' : 'Reconnecting…'}
         </div>
       )}
+      </div>
     </div>
   )
 }
@@ -722,6 +763,339 @@ function StartDMModal({
   )
 }
 
+// =============================================================================
+// SEARCH BAR (top of chat)
+// =============================================================================
+//
+// Unified bar that handles both quick-jump and full-text message search:
+//   • Bare names/text  →  quick-jump suggestions across channels + DMs.
+//   • "@<name>"         →  scope filter; once matched, the rest is the query.
+//                          E.g. "@general bug fix" searches #general for "bug fix".
+//   • Anything else with text  →  message search across all the user's channels.
+//
+// Click a suggestion or message result to jump to that channel.
+
+type SearchScope =
+  | { kind: 'channel'; id: string; label: string }
+  | { kind: 'dm'; id: string; label: string }
+
+type Jumpable = {
+  id: string
+  label: string
+  kind: 'channel' | 'dm'
+  prefix: '#' | '@'
+}
+
+function SearchBar({
+  workspaceSlug,
+  channels,
+  dms,
+  pendingDMs,
+  onJump,
+  onJumpToMessage,
+}: {
+  workspaceSlug: string | null
+  channels: Channel[]
+  dms: DMSummary[]
+  pendingDMs: DMSummary[]
+  onJump: (channelId: string) => void
+  onJumpToMessage: (channelId: string, messageId: string) => void
+}) {
+  const [text, setText] = useState('')
+  const [debounced, setDebounced] = useState('')
+  const [open, setOpen] = useState(false)
+  const [activeIdx, setActiveIdx] = useState(0)
+  const wrapperRef = useRef<HTMLDivElement>(null)
+
+  // Debounce the query value so each keystroke doesn't fire a search.
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebounced(text), 200)
+    return () => window.clearTimeout(t)
+  }, [text])
+
+  // Close on outside click.
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (!wrapperRef.current) return
+      if (!wrapperRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [])
+
+  // ── parse the input ───────────────────────────────────────────────────────
+  // "@general bug fix" → scope candidate "general", residual query "bug fix".
+  // "@gen"              → scope candidate "gen" (still typing the scope), no query.
+  // "bug fix"           → no scope, query "bug fix".
+  const parsed = useMemo(() => parseSearchInput(text, channels, dms, pendingDMs), [
+    text,
+    channels,
+    dms,
+    pendingDMs,
+  ])
+
+  // ── server-side message search ────────────────────────────────────────────
+  const debouncedParsed = useMemo(
+    () => parseSearchInput(debounced, channels, dms, pendingDMs),
+    [debounced, channels, dms, pendingDMs],
+  )
+  const scopeChannelId =
+    debouncedParsed.scope?.kind === 'channel' || debouncedParsed.scope?.kind === 'dm'
+      ? debouncedParsed.scope.id
+      : null
+  const search = useSearchMessages(
+    workspaceSlug,
+    debouncedParsed.query,
+    scopeChannelId,
+  )
+
+  // Pull together what to render in the dropdown.
+  const jumpMatches = parsed.jumpMatches.slice(0, 6)
+  const messageResults = (search.data ?? []).slice(0, 12)
+  const showSearch = debouncedParsed.query.length > 0
+  const totalRows = jumpMatches.length + messageResults.length
+
+  // Reset highlight when the result set changes.
+  useEffect(() => {
+    setActiveIdx(0)
+  }, [text, search.data])
+
+  function commit(idx: number) {
+    if (idx < jumpMatches.length) {
+      const j = jumpMatches[idx]!
+      onJump(j.id)
+    } else {
+      const m = messageResults[idx - jumpMatches.length]!
+      // Message results jump to the channel AND set a scroll target so the
+      // MessageList anchor-loads + scrolls to the specific message.
+      onJumpToMessage(m.channel_id, m.id)
+    }
+    setText('')
+    setOpen(false)
+  }
+
+  function onKey(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Escape') {
+      setOpen(false)
+      ;(e.target as HTMLInputElement).blur()
+      return
+    }
+    if (!open) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setActiveIdx((i) => Math.min(i + 1, Math.max(totalRows - 1, 0)))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setActiveIdx((i) => Math.max(i - 1, 0))
+    } else if (e.key === 'Enter' && totalRows > 0) {
+      e.preventDefault()
+      commit(activeIdx)
+    }
+  }
+
+  const dropdownVisible = open && (jumpMatches.length > 0 || showSearch)
+
+  return (
+    <div ref={wrapperRef} className="relative w-full max-w-xl">
+      <div className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-950/60 px-2.5 py-1.5">
+        <Search className="h-4 w-4 text-zinc-500" />
+        <input
+          value={text}
+          onChange={(e) => {
+            setText(e.target.value)
+            setOpen(true)
+          }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={onKey}
+          placeholder="Search — try @channel or @user"
+          className="flex-1 bg-transparent text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
+          spellCheck={false}
+        />
+        {parsed.scope && (
+          <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-300">
+            {parsed.scope.kind === 'channel' ? '#' : '@'}
+            {parsed.scope.label}
+          </span>
+        )}
+      </div>
+
+      {dropdownVisible && (
+        <div className="absolute left-0 right-0 top-full z-30 mt-1 max-h-[28rem] overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 shadow-2xl">
+          {jumpMatches.length > 0 && (
+            <>
+              <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                Jump to
+              </div>
+              <ul>
+                {jumpMatches.map((j, i) => (
+                  <li key={j.id}>
+                    <button
+                      onClick={() => commit(i)}
+                      onMouseEnter={() => setActiveIdx(i)}
+                      className={
+                        'flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ' +
+                        (i === activeIdx ? 'bg-zinc-800' : 'hover:bg-zinc-800/60')
+                      }
+                    >
+                      <span className="text-zinc-500">{j.prefix}</span>
+                      <span className="text-zinc-100">{j.label}</span>
+                      <span className="ml-auto text-[11px] text-zinc-500">
+                        {j.kind === 'channel' ? 'channel' : 'direct'}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {showSearch && (
+            <>
+              <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                Messages
+                {parsed.scope && (
+                  <span className="ml-1 normal-case text-zinc-400">
+                    in {parsed.scope.kind === 'channel' ? '#' : '@'}{parsed.scope.label}
+                  </span>
+                )}
+              </div>
+              {search.isLoading ? (
+                <div className="px-3 py-2 text-sm text-zinc-500">Searching…</div>
+              ) : search.error ? (
+                <div className="px-3 py-2 text-sm text-rose-400">Search failed.</div>
+              ) : messageResults.length === 0 ? (
+                <div className="px-3 py-2 text-sm text-zinc-500">No matches.</div>
+              ) : (
+                <ul>
+                  {messageResults.map((m, i) => {
+                    const idx = jumpMatches.length + i
+                    const ch = channels.find((c) => c.id === m.channel_id)
+                    const dm = [...dms, ...pendingDMs].find((d) => d.id === m.channel_id)
+                    const where =
+                      ch?.slug ? `#${ch.slug}` :
+                      dm ? `@${dmLabelShort(dm)}` :
+                      '(channel)'
+                    return (
+                      <li key={m.id}>
+                        <button
+                          onClick={() => commit(idx)}
+                          onMouseEnter={() => setActiveIdx(idx)}
+                          className={
+                            'flex w-full flex-col items-start gap-0.5 px-3 py-1.5 text-left text-sm ' +
+                            (idx === activeIdx ? 'bg-zinc-800' : 'hover:bg-zinc-800/60')
+                          }
+                        >
+                          <div className="flex w-full items-center gap-2">
+                            <span className="text-[11px] text-zinc-500">{where}</span>
+                            <span className="ml-auto text-[11px] text-zinc-600">
+                              {new Date(m.created_at).toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="line-clamp-2 text-zinc-200">{m.text}</div>
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// dmLabelShort renders a compact display name for a DM in search context.
+function dmLabelShort(d: DMSummary): string {
+  if (d.other_display_names.length === 0) return '(empty)'
+  if (d.other_display_names.length === 1) return d.other_display_names[0]!
+  return d.other_display_names.slice(0, 2).join(', ') +
+    (d.other_display_names.length > 2 ? ` +${d.other_display_names.length - 2}` : '')
+}
+
+// parseSearchInput interprets the search text:
+//   "@<name>"             → if it matches an existing channel/DM exactly, that
+//                           becomes the active scope and the rest is query.
+//                           If still partial, no scope; jumpMatches lists
+//                           candidates filtered by that partial name.
+//   anything else with @  → ignored as scope (no match), treated as query text.
+//   no leading @          → query text; jump matches consider full input.
+function parseSearchInput(
+  raw: string,
+  channels: Channel[],
+  dms: DMSummary[],
+  pendingDMs: DMSummary[],
+): {
+  scope: SearchScope | null
+  query: string
+  jumpMatches: Jumpable[]
+} {
+  const text = raw.trimStart()
+  let scope: SearchScope | null = null
+  let query = text
+  let jumpFilter = text.toLowerCase()
+
+  if (text.startsWith('@')) {
+    // "@xxx yyy zzz" — split on first space.
+    const sp = text.indexOf(' ')
+    const head = sp === -1 ? text.slice(1) : text.slice(1, sp)
+    const tail = sp === -1 ? '' : text.slice(sp + 1)
+    const headLower = head.toLowerCase()
+
+    // Exact match first — promotes "@general" + space to a real scope.
+    const ch =
+      channels.find((c) => (c.slug ?? '').toLowerCase() === headLower) ??
+      channels.find((c) => (c.name ?? '').toLowerCase() === headLower)
+    const dmAll = [...dms, ...pendingDMs]
+    const dm = dmAll.find((d) =>
+      d.other_display_names.some((n) => n.toLowerCase() === headLower),
+    )
+
+    if (ch && (sp !== -1 || head.length >= (ch.slug ?? ch.name ?? '').length)) {
+      scope = { kind: 'channel', id: ch.id, label: ch.slug ?? ch.name ?? '' }
+      query = tail
+      jumpFilter = ''
+    } else if (dm && (sp !== -1 || head.length >= dm.other_display_names[0]!.length)) {
+      scope = { kind: 'dm', id: dm.id, label: dmLabelShort(dm) }
+      query = tail
+      jumpFilter = ''
+    } else {
+      // Still typing the scope name — no scope yet, narrow jumpMatches by it.
+      jumpFilter = headLower
+      query = '' // don't search messages while still picking a scope
+    }
+  }
+
+  const jumpMatches: Jumpable[] = []
+  if (jumpFilter) {
+    for (const c of channels) {
+      const slug = (c.slug ?? '').toLowerCase()
+      const name = (c.name ?? '').toLowerCase()
+      if (slug.includes(jumpFilter) || name.includes(jumpFilter)) {
+        jumpMatches.push({
+          id: c.id,
+          label: c.slug ?? c.name ?? '(unnamed)',
+          kind: 'channel',
+          prefix: '#',
+        })
+      }
+    }
+    for (const d of [...dms, ...pendingDMs]) {
+      if (d.other_display_names.some((n) => n.toLowerCase().includes(jumpFilter))) {
+        jumpMatches.push({
+          id: d.id,
+          label: dmLabelShort(d),
+          kind: 'dm',
+          prefix: '@',
+        })
+      }
+    }
+  }
+
+  return { scope, query: query.trim(), jumpMatches }
+}
+
 function InvitesModal({
   workspaceSlug,
   onClose,
@@ -945,12 +1319,16 @@ function ChannelView({
   members,
   currentUserID,
   realtimeOpen,
+  scrollTargetMessageId,
+  onScrollHandled,
 }: {
   channel: Channel
   workspaceSlug: string
   members?: Member[]
   currentUserID: string
   realtimeOpen: boolean
+  scrollTargetMessageId: string | null
+  onScrollHandled: () => void
 }) {
   const memberMap = new Map((members ?? []).map((m) => [m.user_id, m]))
   const isDM = channel.kind === 'dm' || channel.kind === 'group_dm'
@@ -965,7 +1343,14 @@ function ChannelView({
         {channel.topic && <p className="text-xs text-zinc-400">{channel.topic}</p>}
       </header>
 
-      <MessageList channelId={channel.id} memberMap={memberMap} realtimeOpen={realtimeOpen} />
+      <MessageList
+        channelId={channel.id}
+        memberMap={memberMap}
+        realtimeOpen={realtimeOpen}
+        currentUserID={currentUserID}
+        scrollTargetMessageId={scrollTargetMessageId}
+        onScrollHandled={onScrollHandled}
+      />
       <TypingIndicator userIDs={typingUserIDs} memberMap={memberMap} />
       <Composer
         channelId={channel.id}
@@ -1003,10 +1388,16 @@ function MessageList({
   channelId,
   memberMap,
   realtimeOpen,
+  currentUserID,
+  scrollTargetMessageId,
+  onScrollHandled,
 }: {
   channelId: string
   memberMap: Map<string, Member>
   realtimeOpen: boolean
+  currentUserID: string
+  scrollTargetMessageId: string | null
+  onScrollHandled: () => void
 }) {
   const {
     data,
@@ -1015,7 +1406,9 @@ function MessageList({
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
-  } = useMessages(channelId, realtimeOpen)
+  } = useMessages(channelId, realtimeOpen, scrollTargetMessageId)
+  // Briefly highlight the target message on arrival so the user sees the jump.
+  const [highlightId, setHighlightId] = useState<string | null>(null)
 
   // Flatten newest-first pages, then reverse for natural top-to-bottom rendering.
   const ordered = useMemo(() => {
@@ -1070,6 +1463,33 @@ function MessageList({
     prependAnchorRef.current = null
   }, [channelId])
 
+  // Scroll-to-target logic. When scrollTargetMessageId is set AND the target
+  // is present in the loaded data, find it in the DOM, scroll into view,
+  // highlight briefly, then clear the request via onScrollHandled.
+  useLayoutEffect(() => {
+    if (!scrollTargetMessageId) return
+    if (!ordered.some((m) => m.id === scrollTargetMessageId)) return
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const node = scroller.querySelector<HTMLElement>(
+      `[data-message-id="${scrollTargetMessageId}"]`,
+    )
+    if (!node) return
+    // Disable sticky-to-bottom for this navigation; we're jumping somewhere
+    // in the middle of history.
+    stickToBottomRef.current = false
+    node.scrollIntoView({ block: 'center', behavior: 'auto' })
+    setHighlightId(scrollTargetMessageId)
+    onScrollHandled()
+  }, [ordered, scrollTargetMessageId, onScrollHandled])
+
+  // Clear the highlight after a short flash.
+  useEffect(() => {
+    if (!highlightId) return
+    const t = window.setTimeout(() => setHighlightId(null), 1800)
+    return () => window.clearTimeout(t)
+  }, [highlightId])
+
   // IntersectionObserver on a sentinel at the top kicks in fetchNextPage.
   useEffect(() => {
     const sentinel = topSentinelRef.current
@@ -1123,30 +1543,94 @@ function MessageList({
       )}
       <ul className="space-y-3">
         {ordered.map((m) => (
-          <MessageItem key={m.id} m={m} member={m.user_id ? memberMap.get(m.user_id) : undefined} />
+          <MessageItem
+            key={m.id}
+            m={m}
+            member={m.user_id ? memberMap.get(m.user_id) : undefined}
+            currentUserID={currentUserID}
+            channelId={channelId}
+            highlighted={m.id === highlightId}
+          />
         ))}
       </ul>
     </div>
   )
 }
 
-function MessageItem({ m, member }: { m: Message; member?: Member }) {
+// Most-used emoji reactions. Click outside or escape closes the picker.
+// Swap for emoji-mart later if the set feels limiting.
+const QUICK_REACTIONS = ['👍', '❤️', '🎉', '😄', '😮', '😢', '🙏', '👀', '🔥']
+
+function MessageItem({
+  m,
+  member,
+  currentUserID,
+  channelId,
+  highlighted = false,
+}: {
+  m: Message
+  member?: Member
+  currentUserID: string
+  channelId: string
+  highlighted?: boolean
+}) {
   const author = member?.display_name ?? '(unknown user)'
   const ts = new Date(m.created_at).toLocaleTimeString()
+  const isOwn = m.user_id === currentUserID
+  const [editing, setEditing] = useState(false)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const editMut = useEditMessage(channelId)
+  const delMut = useDeleteMessage(channelId)
+  const reactMut = useToggleReaction(channelId, currentUserID)
+
+  function handleDelete() {
+    if (!confirm('Delete this message?')) return
+    delMut.mutate(m.id)
+  }
+
+  function handleReact(emoji: string) {
+    const already = !!m.reactions?.find(
+      (r) => r.emoji === emoji && r.user_ids.includes(currentUserID),
+    )
+    reactMut.mutate({ messageId: m.id, emoji, alreadyReacted: already })
+    setPickerOpen(false)
+  }
+
   return (
-    <li>
+    <li
+      data-message-id={m.id}
+      className={
+        'group relative -mx-2 rounded px-2 py-1 transition-colors duration-700 hover:bg-zinc-900/40 ' +
+        (highlighted ? 'bg-amber-500/10 ring-1 ring-amber-500/40' : '')
+      }
+    >
       <div className="flex items-baseline gap-2">
         <span className="font-medium text-zinc-100">{author}</span>
         <span className="text-xs text-zinc-500">{ts}</span>
         {m.edited_at && <span className="text-xs text-zinc-600">(edited)</span>}
       </div>
-      {m.payload ? (
+
+      {editing ? (
+        <InlineEditor
+          initialText={m.text}
+          initialPayload={m.payload as import('@tiptap/react').JSONContent | undefined}
+          onCancel={() => setEditing(false)}
+          onSave={(text, payload) => {
+            editMut.mutate(
+              { messageId: m.id, text, payload },
+              { onSuccess: () => setEditing(false) },
+            )
+          }}
+          pending={editMut.isPending}
+        />
+      ) : m.payload ? (
         <div className="text-zinc-300 break-words">
           <MessageRender doc={m.payload as import('@tiptap/react').JSONContent} />
         </div>
       ) : m.text ? (
         <p className="text-zinc-300 whitespace-pre-wrap break-words">{m.text}</p>
       ) : null}
+
       {m.attachments && m.attachments.length > 0 && (
         <ul className="mt-2 flex flex-wrap gap-2">
           {m.attachments.map((a) => (
@@ -1154,7 +1638,206 @@ function MessageItem({ m, member }: { m: Message; member?: Member }) {
           ))}
         </ul>
       )}
+
+      {m.reactions && m.reactions.length > 0 && (
+        <ul className="mt-1 flex flex-wrap gap-1">
+          {m.reactions.map((r) => {
+            // user_ids comes back null when the Go aggregate-to-strings
+            // helper doesn't recognize the underlying pg type. Defend with
+            // an empty array so the row still renders.
+            const userIDs = r.user_ids ?? []
+            const mine = userIDs.includes(currentUserID)
+            return (
+              <li key={r.emoji}>
+                <button
+                  onClick={() => handleReact(r.emoji)}
+                  title={userIDs
+                    .map((uid) => uid === currentUserID ? 'you' : uid.slice(0, 8))
+                    .join(', ')}
+                  className={
+                    'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors ' +
+                    (mine
+                      ? 'border-sky-500/60 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
+                      : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800')
+                  }
+                >
+                  <span>{r.emoji}</span>
+                  <span className="tabular-nums">{r.count}</span>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {/* hover toolbar — top-right of the row */}
+      {!editing && (
+        <div className="absolute -top-3 right-2 flex items-center rounded border border-zinc-700 bg-zinc-900 opacity-0 shadow-md transition-opacity group-hover:opacity-100">
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setPickerOpen((v) => !v)}
+              title="Add reaction"
+              className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <SmilePlus className="h-4 w-4" />
+            </button>
+            {pickerOpen && (
+              <EmojiPickerPopover
+                onPick={handleReact}
+                onClose={() => setPickerOpen(false)}
+              />
+            )}
+          </div>
+          {isOwn && (
+            <>
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                title="Edit"
+                className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                <Pencil className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={handleDelete}
+                title="Delete"
+                className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-rose-400"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </li>
+  )
+}
+
+function EmojiPickerPopover({
+  onPick,
+  onClose,
+}: {
+  onPick: (emoji: string) => void
+  onClose: () => void
+}) {
+  // Close on outside click + escape.
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (!ref.current) return
+      if (!ref.current.contains(e.target as Node)) onClose()
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('mousedown', onDocClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDocClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+  return (
+    <div
+      ref={ref}
+      className="absolute right-0 top-8 z-10 flex flex-wrap gap-1 rounded-lg border border-zinc-700 bg-zinc-900 p-2 shadow-xl"
+      style={{ width: '13rem' }}
+    >
+      {QUICK_REACTIONS.map((e) => (
+        <button
+          key={e}
+          type="button"
+          onClick={() => onPick(e)}
+          className="flex h-8 w-8 items-center justify-center rounded text-lg hover:bg-zinc-800"
+        >
+          {e}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function InlineEditor({
+  initialText,
+  initialPayload,
+  onCancel,
+  onSave,
+  pending,
+}: {
+  initialText: string
+  initialPayload?: import('@tiptap/react').JSONContent
+  onCancel: () => void
+  onSave: (text: string, payload?: unknown) => void
+  pending: boolean
+}) {
+  // Stash refs for the editor + the latest save() so the editor's onSubmit
+  // (Enter handler) can fire the current closure.
+  const saveRef = useRef<() => void>(() => {})
+  const editor = useChatEditor({
+    placeholder: 'Edit message…',
+    onSubmit() {
+      saveRef.current()
+    },
+  })
+  // Seed the editor with the message's existing content the first time it
+  // mounts. We don't pass `content` to useChatEditor because it doesn't take
+  // it; commands.setContent works on first non-null editor render.
+  const seededRef = useRef(false)
+  useEffect(() => {
+    if (!editor || seededRef.current) return
+    seededRef.current = true
+    if (initialPayload) {
+      editor.commands.setContent(initialPayload)
+    } else if (initialText) {
+      editor.commands.setContent(initialText)
+    }
+    editor.commands.focus('end')
+  }, [editor, initialPayload, initialText])
+
+  function save() {
+    if (!editor) return
+    const text = editor.getText().trim()
+    const json = editor.getJSON()
+    const richEmpty = docIsEmpty(json)
+    if (!text && richEmpty) return
+    onSave(text, !richEmpty ? json : undefined)
+  }
+  saveRef.current = save
+
+  return (
+    <div
+      className="mt-1 rounded border border-zinc-700 bg-zinc-900/40"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault()
+          onCancel()
+        }
+      }}
+    >
+      <EditorView editor={editor} />
+      <div className="flex items-center gap-2 border-t border-zinc-800 px-2 py-1.5">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded px-2 py-1 text-xs text-zinc-400 hover:text-zinc-200"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={save}
+          disabled={pending}
+          className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+        >
+          {pending ? 'Saving…' : 'Save'}
+        </button>
+        <span className="ml-auto text-[11px] text-zinc-500">
+          Enter to save · Shift+Enter for newline · Esc to cancel
+        </span>
+      </div>
+    </div>
   )
 }
 

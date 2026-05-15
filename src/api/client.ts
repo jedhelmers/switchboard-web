@@ -88,9 +88,16 @@ export type Message = {
   // lives in TipTap's package; consumers cast at use site.
   payload?: unknown
   attachments?: AttachmentFile[]
+  reactions?: Reaction[]
   edited_at?: string
   deleted_at?: string
   created_at: string
+}
+
+export type Reaction = {
+  emoji: string
+  count: number
+  user_ids: string[]
 }
 
 export type AttachmentFile = {
