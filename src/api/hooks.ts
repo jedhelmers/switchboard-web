@@ -68,6 +68,45 @@ export function useLogout() {
   })
 }
 
+// useUpdateMe patches the current user's profile. All fields optional —
+// pass only what changed. avatar_object_key is the storage key returned by
+// uploadAvatar; pass empty string to clear the avatar.
+export type UpdateMeVars = {
+  display_name?: string
+  timezone?: string
+  locale?: string
+  avatar_object_key?: string
+}
+
+export function useUpdateMe() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (vars: UpdateMeVars) => api.patch<User>('/v1/me', vars),
+    onSuccess: (user) => {
+      qc.setQueryData(['me'], user)
+      // Members lists across every workspace embed the same display_name and
+      // avatar — refetch so the chat sidebar + message rows update.
+      qc.invalidateQueries({ queryKey: ['members'] })
+    },
+  })
+}
+
+// uploadAvatar runs presign → PUT and resolves to the storage object_key the
+// caller should send back via useUpdateMe. Two phases on purpose: we don't
+// commit the avatar to the user row until the bytes are confirmed in S3.
+export async function uploadAvatar(file: File): Promise<string> {
+  const presigned = await api.post<{ upload_url: string; object_key: string }>(
+    '/v1/me/avatar/presign',
+    {
+      filename: file.name,
+      content_type: file.type || 'application/octet-stream',
+      bytes: file.size,
+    },
+  )
+  await putWithProgress(presigned.upload_url, file)
+  return presigned.object_key
+}
+
 // ---- workspaces / channels --------------------------------------------------
 
 export function useMyWorkspaces() {
@@ -98,6 +137,74 @@ export function useMembers(slug: string | null) {
   })
 }
 
+// ---- unread state ----------------------------------------------------------
+
+// Server returns { unread: { channelId: count, ... } } for every channel the
+// caller belongs to in the workspace, including zero-counts so the client
+// doesn't need a follow-up to render the badge.
+export type UnreadMap = Record<string, number>
+
+export function useUnreadCounts(slug: string | null) {
+  return useQuery<UnreadMap>({
+    queryKey: ['unread', slug],
+    queryFn: () =>
+      api.get<{ unread: UnreadMap }>(`/v1/workspaces/${slug}/unread`).then((r) => r.unread),
+    enabled: !!slug,
+    staleTime: 5_000,
+  })
+}
+
+// useMarkChannelRead is a fire-and-forget POST plus an optimistic local zero
+// so the badge clears the instant the user activates the channel. Server is
+// the source of truth — its SQL guard only moves last_read_at forward, so
+// racing clients can't accidentally re-mark unread.
+export function useMarkChannelRead(slug: string | null) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (channelId: string) =>
+      api.post<void>(`/v1/channels/${channelId}/read`),
+    onMutate: (channelId) => {
+      if (!slug) return
+      qc.setQueryData<UnreadMap>(['unread', slug], (prev) => {
+        if (!prev) return prev
+        if (!(channelId in prev) || prev[channelId] === 0) return prev
+        return { ...prev, [channelId]: 0 }
+      })
+    },
+  })
+}
+
+// bumpUnread increments the cached unread count for one channel in every
+// workspace cache (we don't know which workspace the channel belongs to from
+// the realtime event alone). Called by the realtime patcher on new messages
+// the local user is not the author of and is not currently viewing.
+function bumpUnread(qc: QueryClient, channelId: string) {
+  qc.getQueriesData<UnreadMap>({ queryKey: ['unread'], exact: false }).forEach(
+    ([key, prev]) => {
+      if (!prev) return
+      if (!(channelId in prev)) return
+      qc.setQueryData<UnreadMap>(key, { ...prev, [channelId]: prev[channelId]! + 1 })
+    },
+  )
+}
+
+// Active channel signal — components write the currently-viewed channel id so
+// the realtime patcher knows not to bump unread for it. A bare module ref is
+// fine: there's only one chat surface at a time and React owns the lifecycle.
+const activeChannelRef: { current: string | null } = { current: null }
+
+export function setActiveChannel(channelId: string | null) {
+  activeChannelRef.current = channelId
+}
+
+// Local user id, set by the Chat shell so the realtime patcher can skip
+// bumping unread on the user's own messages.
+const currentUserRef: { current: string | null } = { current: null }
+
+export function setCurrentUser(userId: string | null) {
+  currentUserRef.current = userId
+}
+
 // ---- messages --------------------------------------------------------------
 
 // ---- realtime: shared client + cache integration --------------------------
@@ -111,7 +218,7 @@ let sharedClient: RealtimeClient | null = null
 // Infinite query page shape — matches /v1/channels/{id}/messages response.
 export type MessagesPage = { messages: Message[]; next_cursor?: string }
 
-type MessagesInfiniteData = InfiniteData<MessagesPage, string | undefined>
+export type MessagesInfiniteData = InfiniteData<MessagesPage, string | undefined>
 
 function applyRealtimeEvent(qc: QueryClient, ev: RealtimeEvent) {
   // useMessages keys queries by ['messages', channelId, anchorId ?? ''] so
@@ -123,6 +230,24 @@ function applyRealtimeEvent(qc: QueryClient, ev: RealtimeEvent) {
   const filter = { queryKey: ['messages', ev.channel_id], exact: false } as const
   switch (ev.type) {
     case 'message.created': {
+      const rootId = ev.payload.thread_root_id
+      if (rootId) {
+        // Thread reply — never goes into the channel timeline. Append to
+        // the thread cache if it's loaded (don't create one from a single
+        // reply — we'd be storing a partial page). The parent's reply_count
+        // is updated via bumpReplyCount, which is id-deduped against the
+        // local mutation's onSuccess so the sender never double-counts.
+        qc.setQueryData<ThreadPage>(['thread', rootId], (prev) => {
+          if (!prev) return prev
+          if (prev.replies.some((m) => m.id === ev.message_id)) return prev
+          return {
+            replies: [...prev.replies, ev.payload],
+            reply_count: prev.reply_count + 1,
+          }
+        })
+        bumpReplyCount(qc, ev.channel_id, rootId, ev.message_id, ev.payload.created_at)
+        break
+      }
       qc.setQueriesData<MessagesInfiniteData>(filter, (prev) => {
         if (!prev || prev.pages.length === 0) return prev
         // De-dup across all pages (the poster gets the optimistic POST result first).
@@ -141,19 +266,50 @@ function applyRealtimeEvent(qc: QueryClient, ev: RealtimeEvent) {
       // now have its first message and need to appear in the recipient's
       // sidebar. Cheap: only active queries refetch.
       qc.invalidateQueries({ queryKey: ['dms'] })
+
+      // Bump the unread badge if this message lands in a channel the user
+      // isn't currently viewing AND wasn't sent by them. The active channel
+      // ref + current user ref are written by the Chat shell.
+      const authoredByMe =
+        currentUserRef.current != null &&
+        ev.payload.user_id === currentUserRef.current
+      if (!authoredByMe && activeChannelRef.current !== ev.channel_id) {
+        bumpUnread(qc, ev.channel_id)
+      }
       break
     }
     case 'message.updated': {
+      // Merge rather than replace. The server's edit handler doesn't
+      // populate reply_count / last_reply_at on the broadcast payload (those
+      // come from a separate bulk loader), so a hard replace would wipe
+      // those fields from the cache and the thread badge would vanish on
+      // every edit. Spread-merge preserves everything the new payload
+      // doesn't carry.
       qc.setQueriesData<MessagesInfiniteData>(filter, (prev) => {
         if (!prev) return prev
         return {
           ...prev,
           pages: prev.pages.map((p) => ({
             ...p,
-            messages: p.messages.map((m) => (m.id === ev.message_id ? ev.payload : m)),
+            messages: p.messages.map((m) =>
+              m.id === ev.message_id ? { ...m, ...ev.payload } : m,
+            ),
           })),
         }
       })
+      // Edits to a reply also need to flow into the open thread cache.
+      const updRoot = ev.payload.thread_root_id
+      if (updRoot) {
+        qc.setQueryData<ThreadPage>(['thread', updRoot], (prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            replies: prev.replies.map((m) =>
+              m.id === ev.message_id ? { ...m, ...ev.payload } : m,
+            ),
+          }
+        })
+      }
       break
     }
     case 'message.deleted': {
@@ -167,6 +323,27 @@ function applyRealtimeEvent(qc: QueryClient, ev: RealtimeEvent) {
           })),
         }
       })
+      // If the deleted message was a thread reply, prune it from the open
+      // thread + decrement the parent's reply_count. We don't know rootId
+      // from the event itself, so walk every cached thread.
+      qc.getQueriesData<ThreadPage>({ queryKey: ['thread'], exact: false }).forEach(
+        ([key, prev]) => {
+          if (!prev) return
+          const found = prev.replies.find((m) => m.id === ev.message_id)
+          if (!found) return
+          qc.setQueryData<ThreadPage>(key, {
+            replies: prev.replies.filter((m) => m.id !== ev.message_id),
+            reply_count: Math.max(0, prev.reply_count - 1),
+          })
+          const rootId = key[1] as string | undefined
+          if (rootId) {
+            patchMessage(qc, ev.channel_id, rootId, (m) => ({
+              ...m,
+              reply_count: Math.max(0, (m.reply_count ?? 1) - 1),
+            }))
+          }
+        },
+      )
       break
     }
   }
@@ -367,6 +544,85 @@ export function useToggleReaction(channelId: string | null, currentUserID: strin
 // keep Reaction in scope to satisfy unused-import lint when this file is
 // referenced for types only.
 export type { Reaction }
+
+// ---- threads ---------------------------------------------------------------
+
+export type ThreadPage = { replies: Message[]; reply_count: number }
+
+// useThreadReplies fetches all replies for a thread root. Slack-style threads
+// are 1-deep so a flat list is the whole conversation. We use a plain useQuery
+// (not infinite) because thread depths are bounded in practice.
+export function useThreadReplies(rootId: string | null) {
+  return useQuery<ThreadPage>({
+    queryKey: ['thread', rootId],
+    enabled: !!rootId,
+    queryFn: () => api.get<ThreadPage>(`/v1/messages/${rootId}/replies`),
+  })
+}
+
+// usePostThreadReply posts to a thread and patches both the thread cache and
+// the parent message's reply_count in the channel timeline. The realtime
+// patcher applies the same logic when other clients send replies.
+export function usePostThreadReply(rootId: string | null, channelId: string | null) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (vars: { text: string; payload?: unknown; file_ids?: string[] }) =>
+      api.post<Message>(`/v1/messages/${rootId}/replies`, vars),
+    onSuccess: (reply) => {
+      if (rootId) {
+        qc.setQueryData<ThreadPage>(['thread', rootId], (prev) => {
+          if (!prev) return { replies: [reply], reply_count: 1 }
+          // De-dup in case realtime got here first.
+          if (prev.replies.some((m) => m.id === reply.id)) return prev
+          return { replies: [...prev.replies, reply], reply_count: prev.reply_count + 1 }
+        })
+      }
+      if (channelId && rootId) {
+        bumpReplyCount(qc, channelId, rootId, reply.id, reply.created_at)
+      }
+    },
+  })
+}
+
+// bumpedReplyIds dedups parent reply_count increments by reply id. Both the
+// local mutation (usePostThreadReply.onSuccess) and the realtime patcher try
+// to bump for the same reply — without dedup the sender would double-count
+// because the server publishes the realtime event before the HTTP response
+// returns, so the two paths can race in either order. The id-based check
+// here is order-independent: whichever fires first applies the +1, the
+// second is a no-op. FIFO-evicts after 5000 entries so memory stays bounded.
+const bumpedReplyIds = new Set<string>()
+const bumpedReplyOrder: string[] = []
+const BUMP_DEDUP_CAP = 5000
+
+function rememberBump(replyId: string): boolean {
+  if (bumpedReplyIds.has(replyId)) return false
+  bumpedReplyIds.add(replyId)
+  bumpedReplyOrder.push(replyId)
+  if (bumpedReplyOrder.length > BUMP_DEDUP_CAP) {
+    const evict = bumpedReplyOrder.shift()
+    if (evict) bumpedReplyIds.delete(evict)
+  }
+  return true
+}
+
+// bumpReplyCount adds 1 to the parent's reply_count and updates last_reply_at
+// in every cached variant of the channel's messages list. Idempotent per
+// replyId — call from both usePostThreadReply and applyRealtimeEvent.
+function bumpReplyCount(
+  qc: QueryClient,
+  channelId: string,
+  rootId: string,
+  replyId: string,
+  lastReplyAt: string,
+) {
+  if (!rememberBump(replyId)) return
+  patchMessage(qc, channelId, rootId, (m) => ({
+    ...m,
+    reply_count: (m.reply_count ?? 0) + 1,
+    last_reply_at: lastReplyAt,
+  }))
+}
 
 // ---- channels: create / browse / join --------------------------------------
 

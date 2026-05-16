@@ -3,16 +3,23 @@
 FROM node:22-alpine AS web-build
 WORKDIR /src
 COPY package.json package-lock.json* ./
-RUN npm install
+# Cache npm's package store so a cold rebuild doesn't re-download every dep.
+RUN --mount=type=cache,target=/root/.npm \
+    npm install
 COPY . .
 RUN npm run build
 
 FROM golang:1.25-alpine AS go-build
 WORKDIR /src
 COPY go.mod go.sum* ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY cmd ./cmd
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/web ./cmd/web
+# Build cache mounts here for the same reason as server/Dockerfile — without
+# them, any code change triggers a full from-scratch recompile.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/web ./cmd/web
 
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app

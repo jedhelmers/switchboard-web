@@ -2,6 +2,30 @@
 
 @source "./**/*.{html,tsx,ts}";
 
+/* App-wide text colour. Lives on :root so any descendant inherits it, but
+   Tailwind's `text-*` utilities (e.g. text-zinc-500 for muted captions) still
+   win where they're explicitly set. */
+:root {
+  --text-color: rgba(255, 255, 255, 0.78);
+}
+
+body {
+  color: var(--text-color);
+}
+
+/* Most prominent-text styling in the app reaches for `text-zinc-100`, which
+   compiles to `color: var(--color-zinc-100)` (~#f4f4f5). That fights our
+   --text-color preference. Redirect *the text utility only* — `bg-zinc-100`
+   and `border-zinc-100` keep their original tone because they reference a
+   different CSS property. Same treatment for the secondary tier text-zinc-300. */
+.text-zinc-100,
+.hover\:text-zinc-100:hover {
+  color: var(--text-color);
+}
+.text-zinc-300 {
+  color: var(--text-color);
+}
+
 /* The shell never scrolls. Every scroll happens inside a designated panel
    (chat message list, dashboard tables, modal bodies). */
 html,

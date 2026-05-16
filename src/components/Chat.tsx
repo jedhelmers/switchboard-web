@@ -1,6 +1,8 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import type { Editor } from '@tiptap/react'
 import { EditorView, MessageRender, docIsEmpty, useChatEditor } from './RichEditor'
+import { RightSidebar, useRightSidebar } from './RightSidebar'
 import {
   ALargeSmall,
   AtSign,
@@ -10,6 +12,7 @@ import {
   MoreVertical,
   Pencil,
   Search,
+  Settings,
   Trash2,
   SmilePlus,
   Code,
@@ -19,7 +22,10 @@ import {
   Link as LinkIcon,
   List,
   ListOrdered,
+  MessageSquare,
   Mic,
+  PanelLeftClose,
+  PanelLeftOpen,
   Paperclip,
   Plus,
   Quote,
@@ -28,6 +34,7 @@ import {
   Smile,
   Strikethrough,
   Underline,
+  Upload,
   Video,
   X,
 } from 'lucide-react'
@@ -55,8 +62,18 @@ import {
   usePublicChannels,
   useRealtime,
   useRevokeWorkspaceInvite,
+  usePostThreadReply,
   useStartDM,
+  useThreadReplies,
+  useUpdateMe,
+  uploadAvatar,
   useWorkspaceInvites,
+  useUnreadCounts,
+  useMarkChannelRead,
+  setActiveChannel,
+  setCurrentUser,
+  type MessagesInfiniteData,
+  type UnreadMap,
 } from '../api/hooks'
 import type {
   AttachmentFile,
@@ -104,8 +121,28 @@ export function Chat({
   // them locally so the initiator can see + select their fresh DM in the
   // sidebar before they post the first message.
   const [pendingDMs, setPendingDMs] = useState<DMSummary[]>([])
+  const [showSettings, setShowSettings] = useState(false)
+  // Cmd+/ (Ctrl+/ on Linux/Win) collapses the left nav. Default open.
+  const [leftNavOpen, setLeftNavOpen] = useState(true)
   const logout = useLogout()
   const rtState = useRealtime()
+  // Right-side sidebar slot — threads, soon other things. Cleared on channel
+  // change so a thread from the previous channel doesn't linger.
+  const sidebar = useRightSidebar()
+
+  // Global hotkey: Cmd+/ on Mac, Ctrl+/ on others, toggles the left nav.
+  // Bound on window so it works anywhere in the chat — including while
+  // typing in the composer.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === '/') {
+        e.preventDefault()
+        setLeftNavOpen((v) => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // Resolve effective workspace slug (controlled prop wins).
   const slug = activeWorkspaceSlug ?? internalSlug
@@ -123,6 +160,15 @@ export function Chat({
   const { data: channels } = useChannels(slug)
   const { data: members } = useMembers(slug)
   const { data: dms } = useDMs(slug)
+  const { data: unread } = useUnreadCounts(slug)
+  const markRead = useMarkChannelRead(slug)
+
+  // Tell the realtime patcher who we are + which channel is in view so it
+  // can skip bumping unread for our own sends and for the active channel.
+  useEffect(() => {
+    setCurrentUser(user.id)
+    return () => setCurrentUser(null)
+  }, [user.id])
 
   // Drop any pendingDM the server now reports — first message just landed.
   useEffect(() => {
@@ -138,8 +184,25 @@ export function Chat({
     setPendingDMs([])
   }, [slug])
 
+  // Close any open thread when the channel changes — the parent message
+  // belongs to the previous channel and would not be in the new one's list.
+  useEffect(() => {
+    sidebar.close()
+    // sidebar identity stable per provider; safe to omit from deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChannelId, internalChannelId])
+
   // Resolve effective channel id (controlled prop wins).
   const channelId = activeChannelId ?? internalChannelId
+
+  // Tell the realtime patcher which channel is in view, and mark it read on
+  // activation so the badge clears as soon as the user opens the channel.
+  useEffect(() => {
+    setActiveChannel(channelId)
+    if (channelId) markRead.mutate(channelId)
+    return () => setActiveChannel(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelId])
 
   // Auto-select #general (or first channel) when channels load and nothing selected.
   useEffect(() => {
@@ -234,20 +297,43 @@ export function Chat({
           }
         />
       </header>
-      <div className="grid min-h-0 flex-1 grid-cols-[260px_1fr] overflow-hidden">
-      <aside className="flex flex-col min-h-0 overflow-hidden border-r border-zinc-800 bg-zinc-900/50">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+      {!leftNavOpen && (
+        <CollapsedNavRail
+          workspaceName={
+            workspaces.find((w) => w.slug === slug)?.name ?? '?'
+          }
+          onExpand={() => setLeftNavOpen(true)}
+        />
+      )}
+      <aside
+        className={
+          'flex w-[260px] shrink-0 flex-col min-h-0 overflow-hidden border-r border-zinc-800 bg-zinc-900/50 ' +
+          (leftNavOpen ? '' : 'hidden')
+        }
+      >
         <header className="px-4 py-3 border-b border-zinc-800 space-y-2">
-          <select
-            value={slug ?? ''}
-            onChange={(e) => handleSelectWorkspace(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-sm"
-          >
-            {workspaces.map((w) => (
-              <option key={w.id} value={w.slug}>
-                {w.name}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={slug ?? ''}
+              onChange={(e) => handleSelectWorkspace(e.target.value)}
+              className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-sm"
+            >
+              {workspaces.map((w) => (
+                <option key={w.id} value={w.slug}>
+                  {w.name}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => setLeftNavOpen(false)}
+              title="Collapse sidebar (⌘/)"
+              className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <PanelLeftClose className="h-4 w-4" />
+            </button>
+          </div>
           {isWorkspaceAdmin && slug && (
             <button
               onClick={() => setShowInvites(true)}
@@ -270,6 +356,7 @@ export function Chat({
             activeId={channelId}
             onSelect={handleSelectChannel}
             workspaceSlug={slug}
+            unread={unread}
           />
           <DirectList
             workspaceSlug={slug}
@@ -282,6 +369,7 @@ export function Chat({
             onRemovePendingDM={(id) =>
               setPendingDMs((cur) => cur.filter((d) => d.id !== id))
             }
+            unread={unread}
           />
         </nav>
 
@@ -296,8 +384,24 @@ export function Chat({
               Operator dashboard →
             </button>
           )}
-          <div className="text-zinc-300">{user.display_name}</div>
-          <div className="text-xs text-zinc-500 truncate">{user.email}</div>
+          <div className="flex items-center gap-2">
+            <Avatar
+              src={user.avatar_url}
+              name={user.display_name}
+              size={32}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="text-zinc-300 truncate">{user.display_name}</div>
+              <div className="text-xs text-zinc-500 truncate">{user.email}</div>
+            </div>
+            <button
+              onClick={() => setShowSettings(true)}
+              title="Settings"
+              className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+          </div>
           <button
             onClick={() => logout.mutate()}
             className="mt-2 text-xs text-zinc-400 hover:text-zinc-200"
@@ -307,7 +411,7 @@ export function Chat({
         </footer>
       </aside>
 
-      <section className="flex flex-col min-w-0 min-h-0 overflow-hidden">
+      <section className="flex flex-1 flex-col min-w-0 min-h-0 overflow-hidden">
         {activeChannel ? (
           <ChannelView
             channel={activeChannel}
@@ -329,16 +433,316 @@ export function Chat({
                 : null
             }
             onScrollHandled={() => setScrollTarget(null)}
+            onOpenThread={(rootId) => {
+              if (!activeChannel) return
+              sidebar.open({
+                id: `thread:${rootId}`,
+                title: 'Thread',
+                body: (
+                  <ThreadView
+                    rootId={rootId}
+                    channelId={activeChannel.id}
+                    workspaceSlug={slug ?? ''}
+                    memberMap={
+                      new Map((members ?? []).map((m) => [m.user_id, m]))
+                    }
+                    currentUserID={user.id}
+                  />
+                ),
+              })
+            }}
           />
         ) : (
           <FullPageMessage>Select a channel to start chatting.</FullPageMessage>
         )}
       </section>
+      <RightSidebar />
       {rtState !== 'open' && (
         <div className="absolute top-2 right-2 rounded bg-zinc-900/80 border border-zinc-700 px-2 py-1 text-xs text-zinc-400">
           {rtState === 'connecting' ? 'Connecting…' : 'Reconnecting…'}
         </div>
       )}
+      </div>
+      {showSettings && (
+        <UserSettingsModal user={user} onClose={() => setShowSettings(false)} />
+      )}
+    </div>
+  )
+}
+
+// CollapsedNavRail — the thin sidebar shown when the left nav is collapsed.
+// Slack-style minimal rail: just the workspace badge + an expand button. Keeps
+// a visible anchor so the user has somewhere to click to bring the sidebar
+// back without remembering Cmd+/.
+function CollapsedNavRail({
+  workspaceName,
+  onExpand,
+}: {
+  workspaceName: string
+  onExpand: () => void
+}) {
+  const initial = workspaceName.trim().charAt(0).toUpperCase() || '?'
+  return (
+    <aside className="flex w-12 shrink-0 flex-col items-center gap-2 border-r border-zinc-800 bg-zinc-900/50 py-3">
+      <div
+        title={workspaceName}
+        className="flex h-8 w-8 items-center justify-center rounded-md bg-zinc-800 text-sm font-semibold"
+      >
+        {initial}
+      </div>
+      <button
+        type="button"
+        onClick={onExpand}
+        title="Expand sidebar (⌘/)"
+        className="flex h-8 w-8 items-center justify-center rounded text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+      >
+        <PanelLeftOpen className="h-4 w-4" />
+      </button>
+    </aside>
+  )
+}
+
+// Avatar — shows the user's image when available, or a coloured initials
+// fallback when not. Server resigns `src` on every fetch, so we don't worry
+// about expiry here.
+function Avatar({
+  src,
+  name,
+  size = 24,
+  className = '',
+}: {
+  src?: string
+  name: string
+  size?: number
+  className?: string
+}) {
+  const initials = useMemo(() => initialsOf(name), [name])
+  const bg = useMemo(() => colorFromString(name), [name])
+  const style = { width: size, height: size, fontSize: Math.round(size * 0.4) }
+  if (src) {
+    return (
+      <img
+        src={src}
+        alt={name}
+        style={style}
+        className={`rounded-md object-cover bg-zinc-800 ${className}`}
+      />
+    )
+  }
+  return (
+    <div
+      style={{ ...style, backgroundColor: bg }}
+      className={`flex items-center justify-center rounded-md font-semibold text-zinc-900 ${className}`}
+    >
+      {initials}
+    </div>
+  )
+}
+
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase()
+  return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase()
+}
+
+// Stable hash → hue. Avatars stay the same colour for a given name across
+// reloads, which makes scanning a member list easier.
+function colorFromString(s: string): string {
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+  const hue = Math.abs(h) % 360
+  return `hsl(${hue}, 65%, 70%)`
+}
+
+function UserSettingsModal({
+  user,
+  onClose,
+}: {
+  user: User
+  onClose: () => void
+}) {
+  const [displayName, setDisplayName] = useState(user.display_name)
+  const [timezone, setTimezone] = useState(user.timezone)
+  // Local preview URL while the upload is in flight; cleared once the server
+  // round-trip returns the new resigned URL on `me`.
+  const [previewURL, setPreviewURL] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const updateMe = useUpdateMe()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Browser-side timezone list — caller's runtime is the authoritative source.
+  // Falls back to a minimal hand-curated list on older browsers.
+  const timezones = useMemo<string[]>(() => {
+    type IntlWithSupportedTZ = typeof Intl & {
+      supportedValuesOf?: (key: 'timeZone') => string[]
+    }
+    const i = Intl as IntlWithSupportedTZ
+    if (typeof i.supportedValuesOf === 'function') {
+      return i.supportedValuesOf('timeZone')
+    }
+    return ['UTC', 'America/New_York', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo']
+  }, [])
+
+  async function handleFileChosen(file: File) {
+    setError(null)
+    if (!file.type.startsWith('image/')) {
+      setError('Please choose an image file.')
+      return
+    }
+    setUploading(true)
+    const localPreview = URL.createObjectURL(file)
+    setPreviewURL(localPreview)
+    try {
+      const objectKey = await uploadAvatar(file)
+      await updateMe.mutateAsync({ avatar_object_key: objectKey })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed')
+      setPreviewURL(null)
+      URL.revokeObjectURL(localPreview)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function handleSave() {
+    setError(null)
+    const changes: { display_name?: string; timezone?: string } = {}
+    if (displayName.trim() !== user.display_name) {
+      changes.display_name = displayName.trim()
+    }
+    if (timezone !== user.timezone) {
+      changes.timezone = timezone
+    }
+    if (Object.keys(changes).length === 0) {
+      onClose()
+      return
+    }
+    try {
+      await updateMe.mutateAsync(changes)
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Save failed')
+    }
+  }
+
+  function handleRemoveAvatar() {
+    setError(null)
+    setPreviewURL(null)
+    updateMe.mutate({ avatar_object_key: '' })
+  }
+
+  const showAvatarSrc = previewURL ?? user.avatar_url
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-zinc-100">User settings</h2>
+          <button
+            onClick={onClose}
+            className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </header>
+
+        {/* avatar block ------------------------------------------------------ */}
+        <div className="mb-5 flex items-center gap-4">
+          <Avatar src={showAvatarSrc} name={displayName || user.display_name} size={64} />
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="inline-flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+            >
+              <Upload className="h-3.5 w-3.5" />
+              {uploading ? 'Uploading…' : 'Upload image'}
+            </button>
+            {(user.avatar_url || previewURL) && !uploading && (
+              <button
+                type="button"
+                onClick={handleRemoveAvatar}
+                className="text-left text-xs text-zinc-500 hover:text-rose-400"
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) void handleFileChosen(f)
+              e.target.value = ''
+            }}
+          />
+        </div>
+
+        {/* display name ----------------------------------------------------- */}
+        <label className="mb-3 block">
+          <span className="mb-1 block text-xs font-medium text-zinc-400">Display name</span>
+          <input
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            maxLength={80}
+            className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-sky-500"
+          />
+        </label>
+
+        {/* email (read-only) ------------------------------------------------ */}
+        <label className="mb-3 block">
+          <span className="mb-1 block text-xs font-medium text-zinc-400">Email</span>
+          <input
+            value={user.email}
+            disabled
+            className="w-full cursor-not-allowed rounded border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-500"
+          />
+        </label>
+
+        {/* timezone --------------------------------------------------------- */}
+        <label className="mb-4 block">
+          <span className="mb-1 block text-xs font-medium text-zinc-400">Timezone</span>
+          <select
+            value={timezone}
+            onChange={(e) => setTimezone(e.target.value)}
+            className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-sky-500"
+          >
+            {timezones.includes(timezone) ? null : <option value={timezone}>{timezone}</option>}
+            {timezones.map((tz) => (
+              <option key={tz} value={tz}>{tz}</option>
+            ))}
+          </select>
+        </label>
+
+        {error && <div className="mb-3 text-xs text-rose-400">{error}</div>}
+
+        <footer className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={updateMe.isPending || uploading}
+            className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+          >
+            {updateMe.isPending ? 'Saving…' : 'Save'}
+          </button>
+        </footer>
       </div>
     </div>
   )
@@ -349,11 +753,13 @@ function ChannelList({
   activeId,
   onSelect,
   workspaceSlug,
+  unread,
 }: {
   channels?: Channel[]
   activeId: string | null
   onSelect: (id: string) => void
   workspaceSlug: string | null
+  unread?: UnreadMap
 }) {
   const [showCreate, setShowCreate] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
@@ -390,21 +796,32 @@ function ChannelList({
         <ul>
           {channels.map((c) => {
             const active = c.id === activeId
+            // Active channel always renders as "read" — markRead fires on
+            // activation, but the count cache may not have caught up yet.
+            const unreadCount = active ? 0 : unread?.[c.id] ?? 0
+            const hasUnread = unreadCount > 0
             return (
               <li key={c.id}>
                 <button
                   onClick={() => onSelect(c.id)}
                   className={
-                    'w-full text-left px-4 py-1.5 text-sm transition-colors ' +
+                    'flex w-full items-center gap-2 px-4 py-1.5 text-left text-sm transition-colors ' +
                     (active
                       ? 'bg-zinc-800 text-zinc-100'
-                      : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200')
+                      : hasUnread
+                        ? 'font-semibold text-zinc-100 hover:bg-zinc-800/50'
+                        : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200')
                   }
                 >
-                  <span className="text-zinc-500 mr-1">#</span>
-                  {c.slug ?? '(dm)'}
+                  <span className="text-zinc-500">#</span>
+                  <span className="flex-1 truncate">{c.slug ?? '(dm)'}</span>
                   {c.archived && (
-                    <span className="ml-2 text-xs text-zinc-600">archived</span>
+                    <span className="text-xs text-zinc-600">archived</span>
+                  )}
+                  {hasUnread && (
+                    <span className="rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
+                      {unreadCount > 99 ? '99+' : unreadCount}
+                    </span>
                   )}
                 </button>
               </li>
@@ -579,6 +996,7 @@ function DirectList({
   pendingDMs,
   onAddPendingDM,
   onRemovePendingDM,
+  unread,
 }: {
   workspaceSlug: string | null
   members: Member[] | undefined
@@ -588,6 +1006,7 @@ function DirectList({
   pendingDMs: DMSummary[]
   onAddPendingDM: (d: DMSummary) => void
   onRemovePendingDM: (id: string) => void
+  unread?: UnreadMap
 }) {
   const { data: dms, isLoading } = useDMs(workspaceSlug)
   const startDM = useStartDM(workspaceSlug)
@@ -627,6 +1046,7 @@ function DirectList({
   const realIDs = new Set((dms ?? []).map((d) => d.id))
   const visiblePending = pendingDMs.filter((p) => !realIDs.has(p.id))
   const merged: DMSummary[] = [...visiblePending, ...(dms ?? [])]
+  const memberMap = new Map((members ?? []).map((m) => [m.user_id, m]))
 
   return (
     <section className="mt-4">
@@ -651,20 +1071,40 @@ function DirectList({
           {merged.map((d) => {
             const active = d.id === activeId
             const label = dmLabel(d)
+            // For 1:1 DMs, pull the other user's avatar from the workspace
+            // members map. Group DMs fall back to initials.
+            const peer =
+              d.kind === 'dm' && d.other_user_ids.length === 1
+                ? memberMap.get(d.other_user_ids[0]!)
+                : undefined
+            const unreadCount = active ? 0 : unread?.[d.id] ?? 0
+            const hasUnread = unreadCount > 0
             return (
               <li key={d.id} className="group relative flex items-center">
                 <button
                   onClick={() => onSelect(d.id)}
                   className={
-                    'flex-1 text-left px-4 py-1.5 text-sm transition-colors truncate ' +
+                    'flex flex-1 items-center gap-2 px-4 py-1 text-left text-sm transition-colors ' +
                     (active
                       ? 'bg-zinc-800 text-zinc-100'
-                      : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200')
+                      : hasUnread
+                        ? 'font-semibold text-zinc-100 hover:bg-zinc-800/50'
+                        : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200')
                   }
                   title={d.other_emails.join(', ')}
                 >
-                  <span className="text-zinc-500 mr-1">@</span>
-                  {label}
+                  <Avatar
+                    src={peer?.avatar_url}
+                    name={label}
+                    size={20}
+                    className="shrink-0"
+                  />
+                  <span className="flex-1 truncate">{label}</span>
+                  {hasUnread && (
+                    <span className="rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
+                      {unreadCount > 99 ? '99+' : unreadCount}
+                    </span>
+                  )}
                 </button>
                 <button
                   onClick={() => handleClose(d)}
@@ -1314,10 +1754,13 @@ function MemberList({ members }: { members?: Member[] }) {
       </h2>
       <ul>
         {members.map((m) => (
-          <li key={m.user_id} className="px-4 py-1 text-sm text-zinc-400">
-            <span className="text-zinc-500 mr-1">·</span>
-            {m.display_name}
-            <span className="ml-2 text-xs text-zinc-600">{m.role}</span>
+          <li
+            key={m.user_id}
+            className="flex items-center gap-2 px-4 py-1 text-sm text-zinc-400"
+          >
+            <Avatar src={m.avatar_url} name={m.display_name} size={20} />
+            <span className="truncate">{m.display_name}</span>
+            <span className="ml-auto text-xs text-zinc-600">{m.role}</span>
           </li>
         ))}
       </ul>
@@ -1335,6 +1778,7 @@ function ChannelView({
   onScrollHandled,
   isWorkspaceAdmin,
   onChannelGone,
+  onOpenThread,
 }: {
   channel: Channel
   workspaceSlug: string
@@ -1345,6 +1789,7 @@ function ChannelView({
   onScrollHandled: () => void
   isWorkspaceAdmin: boolean
   onChannelGone: () => void
+  onOpenThread: (rootId: string) => void
 }) {
   const memberMap = new Map((members ?? []).map((m) => [m.user_id, m]))
   const isDM = channel.kind === 'dm' || channel.kind === 'group_dm'
@@ -1375,6 +1820,7 @@ function ChannelView({
         currentUserID={currentUserID}
         scrollTargetMessageId={scrollTargetMessageId}
         onScrollHandled={onScrollHandled}
+        onOpenThread={onOpenThread}
       />
       <TypingIndicator userIDs={typingUserIDs} memberMap={memberMap} />
       <Composer
@@ -1500,6 +1946,7 @@ function MessageList({
   currentUserID,
   scrollTargetMessageId,
   onScrollHandled,
+  onOpenThread,
 }: {
   channelId: string
   memberMap: Map<string, Member>
@@ -1507,6 +1954,7 @@ function MessageList({
   currentUserID: string
   scrollTargetMessageId: string | null
   onScrollHandled: () => void
+  onOpenThread: (rootId: string) => void
 }) {
   const {
     data,
@@ -1518,6 +1966,9 @@ function MessageList({
   } = useMessages(channelId, realtimeOpen, scrollTargetMessageId)
   // Briefly highlight the target message on arrival so the user sees the jump.
   const [highlightId, setHighlightId] = useState<string | null>(null)
+  // Persistent keyboard selection — driven by Up/Down arrows. Visually
+  // distinct from `highlightId` (which flashes for ~2s after a search jump).
+  const [selectedId, setSelectedId] = useState<string | null>(null)
 
   // Flatten newest-first pages, then reverse for natural top-to-bottom rendering.
   const ordered = useMemo(() => {
@@ -1525,6 +1976,97 @@ function MessageList({
     const flat = data.pages.flatMap((p) => p.messages)
     return flat.slice().reverse()
   }, [data])
+
+  // Arrow-key navigation through the loaded messages. Bound on window so it
+  // works whether the composer is focused or not (the user explicitly asked
+  // for this — it overrides TipTap's normal cursor movement). Escape clears.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown' && e.key !== 'Escape') {
+        return
+      }
+      // Don't fight modifier-augmented arrows (Shift+Up for selection,
+      // Cmd+Up for line jump in editors, etc.).
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return
+      if (e.key === 'Escape') {
+        if (selectedId != null) {
+          e.preventDefault()
+          setSelectedId(null)
+        }
+        return
+      }
+      if (ordered.length === 0) return
+      e.preventDefault()
+      const dir = e.key === 'ArrowDown' ? 1 : -1
+      setSelectedId((cur) => {
+        if (cur == null) {
+          // No selection yet — first press grabs the most recent message.
+          return ordered[ordered.length - 1]!.id
+        }
+        const idx = ordered.findIndex((m) => m.id === cur)
+        if (idx === -1) return ordered[ordered.length - 1]!.id
+        const next = Math.max(0, Math.min(ordered.length - 1, idx + dir))
+        return ordered[next]!.id
+      })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [ordered, selectedId])
+
+  // Reset selection when the channel switches — the previous selection
+  // doesn't refer to anything in the new view.
+  useEffect(() => {
+    setSelectedId(null)
+  }, [channelId])
+
+  // Scroll the selected message into view as the highlight moves. `nearest`
+  // avoids a jolt when the selection is already on screen.
+  useEffect(() => {
+    if (!selectedId) return
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const node = scroller.querySelector<HTMLElement>(
+      `[data-message-id="${selectedId}"]`,
+    )
+    if (node) node.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+  }, [selectedId])
+
+  // ID of the current user's most recent message in the loaded set. Drives
+  // edit-eligibility — only the user's last message is editable, matching the
+  // server's NOT EXISTS guard in the EditMessage query.
+  const myLatestMessageId = useMemo(() => {
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const m = ordered[i]
+      if (m && m.user_id === currentUserID) return m.id
+    }
+    return null
+  }, [ordered, currentUserID])
+
+  // 'e' hotkey — enter edit mode on the selected message, but only when
+  // (1) the selection IS the user's most recent message in this channel
+  // (server rejects edits on older messages anyway), and (2) the user
+  // isn't currently typing in an editable area (otherwise pressing 'e' in
+  // the composer would always trip the hotkey). Counter-based so the
+  // MessageItem's effect re-fires on every press, not just the first.
+  const [editRequestTick, setEditRequestTick] = useState(0)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'e' && e.key !== 'E') return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      if (!selectedId || selectedId !== myLatestMessageId) return
+      // Bail if the user is mid-type — TipTap renders into a ProseMirror
+      // contentEditable, so check both that and the boring form controls.
+      const active = document.activeElement as HTMLElement | null
+      if (active) {
+        if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') return
+        if (active.isContentEditable) return
+      }
+      e.preventDefault()
+      setEditRequestTick((t) => t + 1)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selectedId, myLatestMessageId])
 
   // ── scroll anchoring ─────────────────────────────────────────────────────
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -1651,19 +2193,100 @@ function MessageList({
         <div className="text-sm text-zinc-500">No messages yet. Start the conversation.</div>
       )}
       <ul className="space-y-3">
-        {ordered.map((m) => (
-          <MessageItem
-            key={m.id}
-            m={m}
-            member={m.user_id ? memberMap.get(m.user_id) : undefined}
-            currentUserID={currentUserID}
-            channelId={channelId}
-            highlighted={m.id === highlightId}
-          />
-        ))}
+        {ordered.map((m, i) => {
+          const prev = i > 0 ? ordered[i - 1] : null
+          const showDivider =
+            !prev || !sameLocalDay(prev.created_at, m.created_at)
+          return (
+            <Fragment key={m.id}>
+              {showDivider && <DayDivider iso={m.created_at} />}
+              <MessageItem
+                m={m}
+                member={m.user_id ? memberMap.get(m.user_id) : undefined}
+                currentUserID={currentUserID}
+                channelId={channelId}
+                highlighted={m.id === highlightId}
+                selected={m.id === selectedId}
+                isMyLatest={m.id === myLatestMessageId}
+                onOpenThread={onOpenThread}
+                editRequestTick={m.id === selectedId ? editRequestTick : 0}
+              />
+            </Fragment>
+          )
+        })}
       </ul>
     </div>
   )
+}
+
+// True when two ISO timestamps fall on the same calendar day in the user's
+// local timezone. Used to group messages under day dividers; the wall-clock
+// day is what a reader expects to see, not UTC midnight.
+function sameLocalDay(aISO: string, bISO: string): boolean {
+  const a = new Date(aISO)
+  const b = new Date(bISO)
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  )
+}
+
+function dayLabel(iso: string): string {
+  const d = new Date(iso)
+  const now = new Date()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  if (sameLocalDay(iso, now.toISOString())) return 'Today'
+  if (sameLocalDay(iso, yesterday.toISOString())) return 'Yesterday'
+  // Within the last week: just the weekday. Older: full date.
+  const diffDays = Math.floor(
+    (now.getTime() - d.getTime()) / (1000 * 60 * 60 * 24),
+  )
+  if (diffDays > 0 && diffDays < 7) {
+    return d.toLocaleDateString(undefined, { weekday: 'long' })
+  }
+  return d.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric',
+  })
+}
+
+// Day divider — Slack-style floating pill, centered, no through-line. A subtle
+// hairline sits behind it so the eye still picks up the day break even when
+// the pill itself blends in.
+function DayDivider({ iso }: { iso: string }) {
+  return (
+    <li
+      role="separator"
+      aria-label={dayLabel(iso)}
+      className="relative my-4 flex items-center justify-center"
+    >
+      <span className="absolute inset-x-0 top-1/2 border-t border-zinc-800" />
+      <span className="relative z-10 inline-flex items-center gap-1 rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1 text-xs font-semibold text-zinc-300 shadow-sm">
+        {dayLabel(iso)}
+        <ChevronDown className="h-3 w-3 text-zinc-500" />
+      </span>
+    </li>
+  )
+}
+
+// timeAgo — short, Slack-style relative timestamp ("just now", "5m ago",
+// "2h ago", "3d ago"). Falls back to a date string past a week.
+function timeAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime()
+  const s = Math.floor(ms / 1000)
+  if (s < 30) return 'just now'
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  const d = Math.floor(h / 24)
+  if (d < 7) return `${d}d ago`
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 // Most-used emoji reactions. Click outside or escape closes the picker.
@@ -1676,21 +2299,51 @@ function MessageItem({
   currentUserID,
   channelId,
   highlighted = false,
+  selected = false,
+  isMyLatest = false,
+  onOpenThread,
+  editRequestTick = 0,
 }: {
   m: Message
   member?: Member
   currentUserID: string
   channelId: string
+  // Transient flash after a search-jump or anchor scroll.
   highlighted?: boolean
+  // Persistent state from keyboard navigation. Distinct visual.
+  selected?: boolean
+  isMyLatest?: boolean
+  onOpenThread?: (rootId: string) => void
+  // Counter from MessageList — bumps every time the user presses 'e' on the
+  // selected message. We enter edit mode whenever it ticks up. Zero means no
+  // pending request.
+  editRequestTick?: number
 }) {
   const author = member?.display_name ?? '(unknown user)'
-  const ts = new Date(m.created_at).toLocaleTimeString()
+  // Slack-style "10:04 AM" — drop seconds.
+  const ts = new Date(m.created_at).toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  })
   const isOwn = m.user_id === currentUserID
   const [editing, setEditing] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const editMut = useEditMessage(channelId)
   const delMut = useDeleteMessage(channelId)
   const reactMut = useToggleReaction(channelId, currentUserID)
+
+  // Honor 'e' hotkey requests from MessageList. The parent gates on
+  // ownership + isMyLatest already, but we also require the tick to be
+  // non-zero (zero = "no pending request"). Defensive isOwn + isMyLatest
+  // checks here too in case the prop is passed in error.
+  useEffect(() => {
+    if (editRequestTick === 0) return
+    if (!isOwn || !isMyLatest) return
+    setEditing(true)
+    // We only care about the tick changing; the gates are stable for the
+    // lifetime of this MessageItem instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editRequestTick])
 
   function handleDelete() {
     if (!confirm('Delete this message?')) return
@@ -1709,12 +2362,23 @@ function MessageItem({
     <li
       data-message-id={m.id}
       className={
-        'group relative -mx-2 rounded px-2 py-1 transition-colors duration-700 hover:bg-zinc-900/40 ' +
-        (highlighted ? 'bg-amber-500/10 ring-1 ring-amber-500/40' : '')
+        'message-row group relative -mx-2 flex gap-3 rounded px-2 py-1 transition-colors duration-700 hover:bg-zinc-900/40 ' +
+        (highlighted
+          ? 'bg-amber-500/10 ring-1 ring-amber-500/40'
+          : selected
+            ? 'bg-sky-500/10 ring-1 ring-sky-500/40'
+            : '')
       }
     >
+      <Avatar
+        src={member?.avatar_url}
+        name={author}
+        size={36}
+        className="mt-0.5 shrink-0"
+      />
+      <div className="min-w-0 flex-1">
       <div className="flex items-baseline gap-2">
-        <span className="font-medium text-zinc-100">{author}</span>
+        <span className="font-bold text-zinc-100">{author}</span>
         <span className="text-xs text-zinc-500">{ts}</span>
         {m.edited_at && <span className="text-xs text-zinc-600">(edited)</span>}
       </div>
@@ -1733,11 +2397,11 @@ function MessageItem({
           pending={editMut.isPending}
         />
       ) : m.payload ? (
-        <div className="text-zinc-300 break-words">
+        <div className="break-words">
           <MessageRender doc={m.payload as import('@tiptap/react').JSONContent} />
         </div>
       ) : m.text ? (
-        <p className="text-zinc-300 whitespace-pre-wrap break-words">{m.text}</p>
+        <p className="whitespace-pre-wrap break-words">{m.text}</p>
       ) : null}
 
       {m.attachments && m.attachments.length > 0 && (
@@ -1779,6 +2443,23 @@ function MessageItem({
         </ul>
       )}
 
+      {/* Thread reply summary — only on root messages with replies. */}
+      {!m.thread_root_id && (m.reply_count ?? 0) > 0 && onOpenThread && (
+        <button
+          type="button"
+          onClick={() => onOpenThread(m.id)}
+          className="mt-1.5 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-sky-400 hover:bg-zinc-800/60"
+        >
+          <MessageSquare className="h-3.5 w-3.5" />
+          <span>{m.reply_count} {m.reply_count === 1 ? 'reply' : 'replies'}</span>
+          {m.last_reply_at && (
+            <span className="font-normal text-zinc-500">
+              Last reply {timeAgo(m.last_reply_at)}
+            </span>
+          )}
+        </button>
+      )}
+
       {/* hover toolbar — top-right of the row */}
       {!editing && (
         <div className="absolute -top-3 right-2 flex items-center rounded border border-zinc-700 bg-zinc-900 opacity-0 shadow-md transition-opacity group-hover:opacity-100">
@@ -1798,16 +2479,28 @@ function MessageItem({
               />
             )}
           </div>
+          {onOpenThread && !m.thread_root_id && (
+            <button
+              type="button"
+              onClick={() => onOpenThread(m.id)}
+              title="Reply in thread"
+              className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <MessageSquare className="h-4 w-4" />
+            </button>
+          )}
           {isOwn && (
             <>
-              <button
-                type="button"
-                onClick={() => setEditing(true)}
-                title="Edit"
-                className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
-              >
-                <Pencil className="h-4 w-4" />
-              </button>
+              {isMyLatest && (
+                <button
+                  type="button"
+                  onClick={() => setEditing(true)}
+                  title="Edit"
+                  className="flex h-7 w-7 items-center justify-center text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+                >
+                  <Pencil className="h-4 w-4" />
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleDelete}
@@ -1820,7 +2513,114 @@ function MessageItem({
           )}
         </div>
       )}
+      </div>
     </li>
+  )
+}
+
+// ThreadView — the *body* portion of a thread (no aside chrome, no header).
+// The surrounding aside + close button live in <RightSidebar>; this component
+// just fills the slot the sidebar context hands it.
+function ThreadView({
+  rootId,
+  channelId,
+  workspaceSlug,
+  memberMap,
+  currentUserID,
+}: {
+  rootId: string
+  channelId: string
+  // Needed so the embedded Composer can presign attachment uploads — uploads
+  // are workspace-scoped, not channel-scoped.
+  workspaceSlug: string
+  memberMap: Map<string, Member>
+  currentUserID: string
+}) {
+  const { data, isLoading, error } = useThreadReplies(rootId)
+  const scrollerRef = useRef<HTMLDivElement>(null)
+
+  // Stick to bottom on each new reply — threads read top-down chronologically.
+  useLayoutEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [data?.replies.length])
+
+  // Look up the parent message in the channel cache to render it inline at
+  // the top of the panel. Falls back to a "loading" line if the channel
+  // timeline page that contained it hasn't been fetched.
+  const qc = useQueryClient()
+  const parent = useMemo<Message | undefined>(() => {
+    const all = qc.getQueriesData<MessagesInfiniteData>({
+      queryKey: ['messages', channelId],
+      exact: false,
+    })
+    for (const [, infinite] of all) {
+      if (!infinite) continue
+      for (const page of infinite.pages) {
+        const found = page.messages.find((m) => m.id === rootId)
+        if (found) return found
+      }
+    }
+    return undefined
+  }, [qc, channelId, rootId, data])
+
+  return (
+    <div className="flex h-full flex-col min-h-0">
+      <div ref={scrollerRef} className="flex-1 overflow-y-auto px-3 py-3 min-h-0">
+        {parent && (
+          <div className="border-b border-zinc-800 pb-3 mb-3">
+            <ul>
+              <MessageItem
+                m={parent}
+                member={parent.user_id ? memberMap.get(parent.user_id) : undefined}
+                currentUserID={currentUserID}
+                channelId={channelId}
+              />
+            </ul>
+          </div>
+        )}
+
+        {data && (
+          <p className="px-1 pb-2 text-xs text-zinc-500">
+            {data.reply_count} {data.reply_count === 1 ? 'reply' : 'replies'}
+          </p>
+        )}
+
+        {isLoading && (
+          <div className="text-sm text-zinc-500">Loading replies…</div>
+        )}
+        {error && (
+          <div className="text-sm text-rose-400">
+            Error loading thread: {String(error)}
+          </div>
+        )}
+        {data && data.replies.length === 0 && (
+          <div className="text-xs text-zinc-500">No replies yet — be the first.</div>
+        )}
+        {data && data.replies.length > 0 && (
+          <ul className="space-y-3">
+            {data.replies.map((r) => (
+              <MessageItem
+                key={r.id}
+                m={r}
+                member={r.user_id ? memberMap.get(r.user_id) : undefined}
+                currentUserID={currentUserID}
+                channelId={channelId}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <Composer
+        channelId={channelId}
+        workspaceSlug={workspaceSlug}
+        archived={false}
+        mode="thread"
+        threadRootId={rootId}
+      />
+    </div>
   )
 }
 
@@ -2005,24 +2805,41 @@ function Composer({
   channelId,
   workspaceSlug,
   archived,
+  mode = 'channel',
+  threadRootId,
 }: {
   channelId: string
   workspaceSlug: string
   archived: boolean
+  // 'channel' posts to the channel timeline (default).
+  // 'thread' posts as a reply to `threadRootId`. Typing indicators are
+  // suppressed in thread mode (threads don't surface them).
+  mode?: 'channel' | 'thread'
+  threadRootId?: string
 }) {
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [dragActive, setDragActive] = useState(false)
   const [hasContent, setHasContent] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const post = usePostMessage(channelId)
-  const typing = useTypingNotifier(channelId)
+  // Both mutations are always declared so React hook order stays stable; only
+  // the one matching `mode` is invoked by send().
+  const postChannel = usePostMessage(channelId)
+  const postThread = usePostThreadReply(threadRootId ?? null, channelId)
+  const post = mode === 'thread' ? postThread : postChannel
+  // Typing notifier is a no-op when channelId is null; pass null in thread
+  // mode so we don't broadcast typing into the channel surface.
+  const typing = useTypingNotifier(mode === 'thread' ? null : channelId)
 
   // Bookkeeping refs let send/onUpdate read state without re-creating the editor.
   const editorRef = useRef<Editor | null>(null)
   const sendRef = useRef<() => void>(() => {})
 
   const editor = useChatEditor({
-    placeholder: archived ? 'Channel is archived' : 'Message…',
+    placeholder: archived
+      ? 'Channel is archived'
+      : mode === 'thread'
+        ? 'Reply…'
+        : 'Message…',
     disabled: archived,
     onUpdate(e) {
       const empty = docIsEmpty(e.getJSON())

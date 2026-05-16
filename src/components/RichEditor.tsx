@@ -149,7 +149,11 @@ export function EditorView({ editor }: { editor: Editor | null }) {
 }
 
 // MessageRender is the readonly rendering of a TipTap JSON document, used in
-// the message list. Memoized via key so we don't reinitialize per render.
+// the message list. `useEditor` only takes `content` as an initializer — it
+// won't update when the prop changes — so a follow-up effect calls
+// setContent whenever the JSON shape actually differs. Without this, an
+// edit that lands via realtime would leave the on-screen message frozen at
+// its pre-edit text.
 export function MessageRender({ doc }: { doc: JSONContent }) {
   const editor = useEditor({
     extensions: [
@@ -171,6 +175,19 @@ export function MessageRender({ doc }: { doc: JSONContent }) {
       },
     },
   })
+
+  // Compare by serialized content rather than reference: parent re-renders
+  // hand us a new object identity each time even when the doc is unchanged,
+  // and we don't want to thrash setContent on every render.
+  const serialized = JSON.stringify(doc)
+  const lastSerializedRef = useRef<string>(serialized)
+  useEffect(() => {
+    if (!editor) return
+    if (serialized === lastSerializedRef.current) return
+    lastSerializedRef.current = serialized
+    editor.commands.setContent(doc, { emitUpdate: false })
+  }, [editor, serialized, doc])
+
   return <EditorContent editor={editor} />
 }
 

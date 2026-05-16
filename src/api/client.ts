@@ -89,6 +89,10 @@ export type Message = {
   payload?: unknown
   attachments?: AttachmentFile[]
   reactions?: Reaction[]
+  // Populated only on root (parent) messages by the channel-list endpoint.
+  // Replies themselves leave it absent.
+  reply_count?: number
+  last_reply_at?: string
   edited_at?: string
   deleted_at?: string
   created_at: string
