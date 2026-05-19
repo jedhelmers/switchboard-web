@@ -44,7 +44,10 @@ import type {
 } from '@stack/client'
 
 type MemberRole = 'owner' | 'admin' | 'member' | 'guest' | 'bot'
-const MEMBER_ROLES: MemberRole[] = ['owner', 'admin', 'member', 'guest', 'bot']
+// Roles operators can assign through the UI. `bot` is reserved for API /
+// integration accounts; existing bot members stay visible as a read-only
+// pill, but can't be created or switched-to from the dashboard.
+const SELECTABLE_ROLES: MemberRole[] = ['owner', 'admin', 'member', 'guest']
 
 type Tab =
   | 'stats'
@@ -345,7 +348,9 @@ function CreateWorkspaceModal({ onClose }: { onClose: () => void }) {
             className={modalInputClass}
           />
         </Field>
-        {create.error && <p className="text-sm text-rose-400">{String(create.error)}</p>}
+        {create.error && (
+          <p className="text-sm text-rose-400">{formatOperatorError(create.error, 'workspace_create')}</p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button type="button" onClick={onClose} className="rounded px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200">
             Cancel
@@ -429,10 +434,10 @@ function WorkspaceMembersModal({
             />
           )}
           {update.error && (
-            <p className="mt-2 text-sm text-rose-400">{formatMemberError(update.error)}</p>
+            <p className="mt-2 text-sm text-rose-400">{formatOperatorError(update.error, 'member_update')}</p>
           )}
           {remove.error && (
-            <p className="mt-2 text-sm text-rose-400">{formatMemberError(remove.error)}</p>
+            <p className="mt-2 text-sm text-rose-400">{formatOperatorError(remove.error, 'member_remove')}</p>
           )}
         </div>
       </div>
@@ -440,12 +445,45 @@ function WorkspaceMembersModal({
   )
 }
 
-// formatMemberError surfaces the 409 cross_app_membership case as a friendly
-// sentence. Everything else falls back to the raw error string — same
-// contract as the other modal error displays in this file.
-function formatMemberError(err: unknown): string {
-  if (err instanceof APIError && err.status === 409) {
-    return "User belongs to a different parent app and can't join this workspace."
+// Context tells the formatter which spec-defined error to expect from
+// a given operator endpoint. The server response carries a `code` in
+// the body, but APIError today only captures status + title + detail —
+// so we dispatch on (status, context) instead of code. Add to this
+// when a new operator flow gets its own error vocabulary.
+type OperatorErrorContext =
+  | 'workspace_create'
+  | 'workspace_action'
+  | 'member_add'
+  | 'member_update'
+  | 'member_remove'
+
+// formatOperatorError maps an APIError to a friendly sentence per the
+// spec's status/code table. Non-APIError values (network failure,
+// unknown shapes) fall through to `String(err)` — same contract as the
+// other modal error displays in this file.
+function formatOperatorError(err: unknown, ctx: OperatorErrorContext): string {
+  if (!(err instanceof APIError)) return String(err)
+  if (err.status === 403) return "You don't have permission to do that."
+  if (err.status === 404) {
+    switch (ctx) {
+      case 'workspace_create':
+      case 'workspace_action':
+        return 'Workspace no longer exists.'
+      case 'member_add':
+      case 'member_update':
+      case 'member_remove':
+        // 404 from the member endpoints can be either the workspace or
+        // the user being gone. The friendlier phrasing covers both.
+        return 'That workspace or user no longer exists.'
+    }
+  }
+  if (err.status === 409) {
+    if (ctx === 'workspace_create') {
+      return 'A workspace with that slug already exists in this app.'
+    }
+    if (ctx === 'member_add' || ctx === 'member_update') {
+      return "User belongs to a different parent app and can't join this workspace."
+    }
   }
   return String(err)
 }
@@ -551,7 +589,7 @@ function AddMemberForm({
           onChange={(e) => setRole(e.target.value as MemberRole)}
           className={modalInputClass}
         >
-          {MEMBER_ROLES.map((r) => (
+          {SELECTABLE_ROLES.map((r) => (
             <option key={r} value={r}>
               {r}
             </option>
@@ -559,7 +597,7 @@ function AddMemberForm({
         </select>
       </Field>
 
-      {add.error && <p className="text-sm text-rose-400">{formatMemberError(add.error)}</p>}
+      {add.error && <p className="text-sm text-rose-400">{formatOperatorError(add.error, 'member_add')}</p>}
 
       <div className="flex justify-end">
         <button
@@ -592,6 +630,7 @@ function MembersList({
     <div className="space-y-2">
       {rows.map((m) => {
         const busy = busyUserId === m.user_id
+        const isBot = m.role === 'bot'
         return (
           <div
             key={m.user_id}
@@ -600,20 +639,37 @@ function MembersList({
             <Avatar url={m.avatar_url} name={m.display_name} />
             <div className="min-w-0 flex-1">
               <div className="truncate text-zinc-100">{m.display_name}</div>
-              <div className="truncate text-xs text-zinc-500">{m.email}</div>
+              <div className="flex items-center gap-1.5 truncate text-xs text-zinc-500">
+                <span className="truncate">{m.email}</span>
+                {m.joined_at && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>joined <RelTime ts={m.joined_at} /></span>
+                  </>
+                )}
+              </div>
             </div>
-            <select
-              value={MEMBER_ROLES.includes(m.role as MemberRole) ? m.role : 'member'}
-              onChange={(e) => onRoleChange(m.user_id, e.target.value as MemberRole)}
-              disabled={busy}
-              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 disabled:opacity-50"
-            >
-              {MEMBER_ROLES.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
+            {isBot ? (
+              // Bot accounts are managed via the API. Keep them visible
+              // so an operator can see they exist (and remove them if
+              // needed), but don't expose role swaps here.
+              <span className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs uppercase tracking-wider text-zinc-400">
+                bot
+              </span>
+            ) : (
+              <select
+                value={SELECTABLE_ROLES.includes(m.role as MemberRole) ? m.role : 'member'}
+                onChange={(e) => onRoleChange(m.user_id, e.target.value as MemberRole)}
+                disabled={busy}
+                className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 disabled:opacity-50"
+              >
+                {SELECTABLE_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+            )}
             <RowButton variant="danger" onClick={() => onRemove(m)} disabled={busy}>
               Remove
             </RowButton>
