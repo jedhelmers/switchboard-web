@@ -36,7 +36,8 @@ import {
   useTrackToggle,
   useDisconnectButton,
 } from '@livekit/components-react'
-import { Track } from 'livekit-client'
+import { Track, VideoPresets } from 'livekit-client'
+import type { RoomOptions } from 'livekit-client'
 import type { TrackReferenceOrPlaceholder } from '@livekit/components-core'
 import { useJoinHuddle, useLeaveHuddle, type HuddleJoinResponse } from '@stack/client'
 import {
@@ -152,12 +153,71 @@ function LiveKitJoined({
       video={false}
       onConnected={onEntered}
       onDisconnected={onDisconnect}
+      options={huddleRoomOptions}
       className="flex h-full flex-col"
     >
       <HuddleRoom onLeave={onDisconnect} />
       <RoomAudioRenderer />
     </LiveKitRoom>
   )
+}
+
+// huddleRoomOptions — fidelity + bandwidth tuning. Module-scope (not inside
+// the component) so React's reconciler can't accidentally hand <LiveKitRoom>
+// a fresh object on every render, which would re-construct the underlying
+// Room and tear down any in-flight tracks.
+//
+// The four dials:
+//   • videoCaptureDefaults.resolution = h1080 — the camera publishes a 1080p
+//     source. With simulcast on, this becomes the *highest* of three
+//     simulcast layers; subscribers only pay for it when a tile is big
+//     enough to actually display it.
+//   • publishDefaults.videoSimulcastLayers — three rungs of the ladder. The
+//     publisher encodes whatever rungs are being subscribed to (see
+//     dynacast); the SFU forwards the appropriate rung per subscriber
+//     based on their tile size (see adaptiveStream).
+//   • publishDefaults.videoCodec = 'vp9' — better quality-per-bit than the
+//     VP8 default. Chrome + Firefox both negotiate it natively; Safari
+//     falls back to VP8 automatically.
+//   • publishDefaults.videoEncoding.maxBitrate = 3 Mbps — caps the top
+//     simulcast layer. Default is around 1.5 Mbps for 720p, which is
+//     ammunition starved for 1080p. 3 Mbps cleans up motion + screen
+//     share without saturating localhost.
+//
+// adaptiveStream + dynacast are the bandwidth-minimization layer:
+//   • adaptiveStream observes each <VideoTrack> element's actual on-screen
+//     size and asks the SFU for the simulcast layer that matches. Small
+//     tiles get the small layer; full-screen tiles get 1080p.
+//   • dynacast tells the publisher to stop encoding layers no subscriber
+//     is currently consuming. If everyone's in tiny tiles, the publisher
+//     only encodes the low layer and saves the CPU.
+//
+// Together: you get 1080p when something's big, near-zero waste when it
+// isn't, and the publisher's encoder isn't burning cycles on dead layers.
+const huddleRoomOptions: RoomOptions = {
+  adaptiveStream: true,
+  dynacast: true,
+  videoCaptureDefaults: {
+    resolution: VideoPresets.h1080.resolution,
+  },
+  publishDefaults: {
+    videoSimulcastLayers: [
+      VideoPresets.h360,
+      VideoPresets.h720,
+      VideoPresets.h1080,
+    ],
+    videoCodec: 'vp9',
+    videoEncoding: {
+      maxBitrate: 3_000_000,
+      maxFramerate: 30,
+    },
+    // Screen share is uplink-heavy too — bump it explicitly. Without this
+    // it inherits a conservative default and presentations look soft.
+    screenShareEncoding: {
+      maxBitrate: 4_000_000,
+      maxFramerate: 15,
+    },
+  },
 }
 
 // HuddleRoom owns the layout / pin / hide-self state. It must live

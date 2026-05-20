@@ -163,3 +163,171 @@ body,
 .ProseMirror:focus-visible {
   outline: none !important;
 }
+
+/* =============================================================
+   Form-control normalization
+   -------------------------------------------------------------
+   Tailwind preflight handles `font-family: inherit` and most
+   resets, but several cross-browser quirks still bleed through
+   (Safari rounding, Firefox number-spinners, WebKit autofill
+   yellow, picker glyph colour, native select chevron). Normalize
+   them here so every component renders identically without
+   per-input boilerplate.
+   ============================================================= */
+
+:root {
+  /* Tells the UA which palette to use for native widgets
+     (scrollbars, date picker glyphs, default form colours). The
+     library ships dark by default — flip this to `light dark` in
+     a host-app override if you support a light theme. */
+  color-scheme: dark;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+  /* Safari rounds inputs/buttons/selects by default; force the
+     library's own border-radius (or none) to win. */
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  /* iOS Safari & some Android browsers zoom into inputs whose
+     computed font-size is < 16px on focus. Bumping the minimum
+     keeps the page stable. Components that opt into a smaller
+     size override this with their own utility. */
+  font-size: max(1em, 16px);
+}
+
+/* Restore the native chevron for <select> — `appearance: none`
+   above strips it, which is the right default for custom
+   selects, but our plain <select> usages still expect one. */
+select {
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 50%,
+    calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 2rem;
+}
+select::-ms-expand {
+  display: none;
+}
+
+/* Placeholder colour differs between Firefox (50% opacity body
+   colour) and WebKit (light grey). Pin it to a neutral token. */
+::placeholder {
+  color: var(--stack-neutral-500);
+  opacity: 1;
+}
+
+/* WebKit paints autofilled inputs with a hardcoded pale-yellow
+   background and black text that ignores our theme. The inset
+   shadow trick is the only reliable way to mask it. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-text-fill-color: var(--stack-text-body);
+  -webkit-box-shadow: 0 0 0 1000px var(--stack-neutral-900) inset;
+  caret-color: var(--stack-text-body);
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+/* Firefox draws a red inner glow on invalid inputs by default.
+   Components opt into their own invalid styling. */
+input:invalid,
+textarea:invalid,
+select:invalid {
+  box-shadow: none;
+}
+input:-moz-ui-invalid,
+textarea:-moz-ui-invalid {
+  box-shadow: none;
+}
+
+/* Remove the Firefox inner focus outline (we draw our own ring). */
+input::-moz-focus-inner,
+button::-moz-focus-inner {
+  border: 0;
+  padding: 0;
+}
+
+/* Hide number-input spinners. Chrome/Safari and Firefox use
+   different selectors; cover both. */
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* WebKit decorates type="search" with rounded corners and a
+   cancel button; strip them so it matches type="text". */
+input[type="search"] {
+  -webkit-appearance: none;
+}
+input[type="search"]::-webkit-search-decoration,
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-results-button,
+input[type="search"]::-webkit-search-results-decoration {
+  -webkit-appearance: none;
+  display: none;
+}
+
+/* The native calendar/clock icon on date/time inputs is rendered
+   black in WebKit regardless of `color`. Invert it on our dark
+   surfaces so it's actually visible. */
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+input[type="month"]::-webkit-calendar-picker-indicator,
+input[type="week"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  opacity: 0.7;
+  cursor: pointer;
+}
+
+/* iOS Safari adds rounded corners and an inner shadow to
+   <textarea>. Reset to match other inputs. */
+textarea {
+  resize: vertical;
+  -webkit-appearance: none;
+  border-radius: 0;
+}
+
+/* Buttons inherit `text-align: center` on Safari but `start` on
+   Firefox. Pin it. */
+button {
+  text-align: center;
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* file inputs render wildly differently per browser; pin the
+   button surface to neutral tokens so at least the colour is
+   consistent. Components that need a custom file picker should
+   hide the input and trigger it from a styled label. */
+input[type="file"]::-webkit-file-upload-button,
+input[type="file"]::file-selector-button {
+  font: inherit;
+  color: inherit;
+  background: var(--stack-neutral-800);
+  border: 1px solid var(--stack-neutral-700);
+  padding: 0.375rem 0.75rem;
+  border-radius: 0.375rem;
+  margin-right: 0.75rem;
+  cursor: pointer;
+}
