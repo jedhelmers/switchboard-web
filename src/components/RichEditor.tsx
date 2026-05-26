@@ -8,6 +8,7 @@ import StarterKit from '@tiptap/starter-kit'
 import Underline from '@tiptap/extension-underline'
 import Link from '@tiptap/extension-link'
 import Placeholder from '@tiptap/extension-placeholder'
+import { exitCode } from '@tiptap/pm/commands'
 import { useEffect, useReducer, useRef } from 'react'
 import { resolvePayloadRenderer } from '@switchboard/client'
 import { Mention } from './MentionMark'
@@ -32,7 +33,7 @@ const editorClasses = [
   // Code: orange-on-dark for both inline `code` and code blocks.
   '[&_code]:rounded [&_code]:bg-zinc-800 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.9em] [&_code]:font-mono [&_code]:text-orange-400',
   '[&_pre]:my-1.5 [&_pre]:rounded [&_pre]:bg-zinc-950 [&_pre]:border [&_pre]:border-zinc-800 [&_pre]:p-3 [&_pre]:overflow-x-auto',
-  '[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-sm [&_pre_code]:text-orange-400',
+  '[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-sm [&_pre_code]:font-mono [&_pre_code]:text-white/70',
   // ProseMirror writes `is-empty` on a placeholder paragraph; the placeholder
   // extension drops a data attr we use to render the prompt text.
   '[&_p.is-editor-empty:first-child]:before:content-[attr(data-placeholder)]',
@@ -76,6 +77,10 @@ export function useChatEditor(opts: EditorOpts = {}): Editor | null {
         // Disable headings and horizontal rule — Slack-style chat doesn't use them.
         heading: false,
         horizontalRule: false,
+        // We exit code blocks on double-Enter (not the default triple-Enter)
+        // via the custom handleKeyDown below; turn off TipTap's built-in
+        // triple-Enter handler so the two don't fight.
+        codeBlock: { exitOnTripleEnter: false },
       }),
       Underline,
       Link.configure({
@@ -98,6 +103,21 @@ export function useChatEditor(opts: EditorOpts = {}): Editor | null {
       attributes: {
         class: editorClasses,
       },
+      // Triple-backtick exit: when typing ``` at the end of a code block,
+      // strip the two existing backticks and exit instead of inserting the
+      // third one. Slack-style.
+      handleTextInput(view, from, _to, text) {
+        const ed = editorInstanceRef.current
+        if (!ed || !ed.isActive('codeBlock')) return false
+        if (text !== '`') return false
+        const $from = view.state.selection.$from
+        if ($from.parentOffset !== $from.parent.content.size) return false
+        const before = view.state.doc.textBetween(Math.max(0, from - 2), from)
+        if (before !== '``') return false
+        view.dispatch(view.state.tr.delete(from - 2, from))
+        exitCode(view.state, view.dispatch)
+        return true
+      },
       handleKeyDown(_, event) {
         if (event.key !== 'Enter') return false
         // Editor instance for state queries / commands. We can read the
@@ -109,6 +129,24 @@ export function useChatEditor(opts: EditorOpts = {}): Editor | null {
         const inListItem = ed.isActive('listItem')
         const inCodeBlock = ed.isActive('codeBlock')
         const inBlockquote = ed.isActive('blockquote')
+
+        // Code block: double-Enter exits. Enter/Shift+Enter on a non-empty
+        // line just inserts a newline (TipTap default). The trick — once
+        // the user adds the first '\n', a second Enter at the end of the
+        // block leaves us with a trailing '\n', which we strip before
+        // calling exitCode so the surviving code-block stays clean.
+        if (inCodeBlock) {
+          const $from = ed.state.selection.$from
+          const atEnd = $from.parentOffset === $from.parent.content.size
+          const endsWithNewline = $from.parent.textContent.endsWith('\n')
+          if (atEnd && endsWithNewline) {
+            event.preventDefault()
+            ed.view.dispatch(ed.state.tr.delete($from.pos - 1, $from.pos))
+            exitCode(ed.view.state, ed.view.dispatch)
+            return true
+          }
+          return false
+        }
 
         if (event.shiftKey) {
           // Inside a list, shift+enter creates a new list item ("new row")
@@ -123,9 +161,9 @@ export function useChatEditor(opts: EditorOpts = {}): Editor | null {
           return false
         }
 
-        // Plain Enter: inside structural blocks, let the editor do its thing
-        // (new list item, new line in code block, exit blockquote, etc.).
-        if (inListItem || inCodeBlock || inBlockquote) return false
+        // Plain Enter: inside list/blockquote, let the editor do its thing
+        // (new list item, exit blockquote, etc.).
+        if (inListItem || inBlockquote) return false
 
         // Otherwise plain Enter sends the message.
         if (opts.onSubmit) {
